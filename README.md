@@ -27,7 +27,7 @@ Get ready to enhance your music experience with **MP3Vault** – enjoy your favo
 
 ## Limitations
 
-This extension is designed specifically for YouTube. It will not work on other websites or video platforms.
+This app is designed specifically for YouTube. It will not work on other websites or video platforms.
 
 # Experiencing an Issue? ⚠️
 

@@ -29,6 +29,20 @@ Get ready to enhance your music experience with **MP3Vault** – enjoy your favo
 
 This app is designed specifically for YouTube. It will not work on other websites or video platforms.
 
+## Building the .exe
+
+Packaged with [auto-py-to-exe](https://github.com/brentvollebregt/auto-py-to-exe) (a GUI for PyInstaller):
+
+1. `pip install auto-py-to-exe`, then run `auto-py-to-exe`
+2. Script Location: `app.py`
+3. **Additional Files**: add `folder.png`, `editar.png`, and `icon.ico` (pointing to the bundle root, `.`)
+4. Icon: `icon.ico` (sets the `.exe` icon in Windows Explorer)
+5. **Advanced → Additional command line arguments**: add `--collect-data customtkinter`
+   — without this the built `.exe` crashes on launch with `FileNotFoundError: ...customtkinter\assets\themes\blue.json`, since PyInstaller doesn't auto-detect customtkinter's own theme/font data files.
+6. Convert — output lands in `output/`
+
+Onefile and onedir both work; `resourcePath()` in `app.py` resolves assets correctly in either mode via `sys._MEIPASS`.
+
 # Experiencing an Issue? ⚠️
 
 Did you stumble upon a bug or encounter an issue while using **MP3Vault**? Your feedback is invaluable to us! Please report any [bugs or technical glitches](https://github.com/caladavid/MP3Vault/issues)  you encounter so we can swiftly address them and enhance your browsing experience. 

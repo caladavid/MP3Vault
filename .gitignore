@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+
+.claude/
+
+# Personal notes / local-only reference files — not part of the app
+MP3Vault.txt
+TODO.md
+app - copia copy.py

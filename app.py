@@ -1,17 +1,17 @@
 import re
 import sys
 import os
-import customtkinter as ctk
+import subprocess
 import threading
-from customtkinter import * 
-from PIL import Image, ImageTk, ImageOps
-from tkinter import messagebox, ttk
-from moviepy.video.io.VideoFileClip import VideoFileClip
+import customtkinter as ctk
+from customtkinter import *
+from PIL import Image, ImageOps
+from tkinter import messagebox
 from mutagen.easyid3 import EasyID3
-from idlelib.tooltip import Hovertip
+from mutagen.easymp4 import EasyMP4
+from mutagen.flac import FLAC
 import requests
 from io import BytesIO
-from urllib.request import urlopen
 
 import yt_dlp
 
@@ -27,6 +27,17 @@ print("GitHub Repository: https://github.com/caladavid/MP3Vault\n")
 # Define a regular expression pattern to clean filenames
 
 
+# Resolves asset paths both for normal `python app.py` runs and for a PyInstaller-frozen .exe
+# (PyInstaller sets sys._MEIPASS, in both onefile and onedir mode, to the bundle's extract folder).
+def resourcePath(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except AttributeError:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+
+    return os.path.join(base_path, relative_path)
+
+
 class MP3Vault:
     def __init__(self, root):
         # Create the main application window
@@ -37,15 +48,17 @@ class MP3Vault:
         
         # grid layout
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=1)  # videoInfoFrame
-        self.root.rowconfigure(2, weight=1)  # videoConfigFrame
+        self.root.rowconfigure(1, weight=1)  # videoInfoFrame — the only row that should stretch;
+        # optionsRow (row 2) and videoConfigFrame (row 3) keep weight=0 (default) so they always get
+        # exactly their natural height instead of competing with videoInfoFrame for leftover space —
+        # giving row 2 weight=1 here once squeezed optionsRow down to ~1px in the taller (350/700) views.
         
         self.padding = 20
         
         self.regularFont = ctk.CTkFont(family="Lato", size=14);
         self.titleFont = ctk.CTkFont(family="Lato", size=16, weight="bold");
-        self.folderImg = Image.open("folder.png");
-        self.editImg = Image.open("editar.png");
+        self.folderImg = Image.open(resourcePath("folder.png"));
+        self.editImg = Image.open(resourcePath("editar.png"));
         self.downloadPath = "";
         self.urlValue = StringVar();
         self.editInfoWindow = None
@@ -53,7 +66,16 @@ class MP3Vault:
         self.titleAudioVar = ctk.StringVar()
         self.artistAudioVar = ctk.StringVar()
         self.albumAudioVar = ctk.StringVar()
-        
+
+        # Not persisted across restarts by design — resets to mp3/192kbps every launch.
+        self.audioFormatVar = ctk.StringVar(value="mp3")
+        self.audioQualityVar = ctk.StringVar(value="192")
+
+        # Set right before spawning a download thread, checked inside _progress_hook (which runs
+        # ON that thread) to abort cleanly via yt_dlp.utils.DownloadCancelled instead of killing
+        # the thread outright.
+        self.cancelRequested = threading.Event()
+
         # Inicializar variables para almacenar la información del video
         self.title_video = ""
         self.album_video = ""
@@ -68,35 +90,94 @@ class MP3Vault:
 
         #self.root.set_appearance_mode("dark") ARREGLAR
 
-        # Get absolute path to resource, works for dev and for PyInstaller
-        def resource_path(relative_path):
-            try:
-                # PyInstaller creates a temp folder and stores path in _MEIPASS
-                base_path = sys._MEIPASS
-            except Exception:
-                base_path = os.path.abspath(".")
-
-            return os.path.join(base_path, relative_path)
-
         # Set the application icon
-        self.iconPath = resource_path('icon.ico')
+        self.iconPath = resourcePath('icon.ico')
         self.root.iconbitmap(self.iconPath)
 
         self.setupUI();
         self.noURL()
-      
-      
-    """ Open a folder dialog to select the download destination folder """    
+
+        threading.Thread(target=self.checkYtDlpUpdate, daemon=True).start()
+
+
+    """ Open a folder dialog to select the download destination folder """
     def selectDownloadFolder(self):
-        self.downloadPath = filedialog.askdirectory(initialdir="D:\Downloads")
+        self.downloadPath = filedialog.askdirectory(initialdir=os.path.expanduser("~"))
         self.folderInput.configure(text=self.downloadPath)
         print(self.downloadPath)
-        
-        
-        
+
+
+    """ Hides the quality dropdown for lossless/uncompressed formats where bitrate is meaningless """
+    def onFormatChange(self, value):
+        if value in ('flac', 'wav'):
+            self.qualityLabel.grid_remove()
+            self.qualityMenu.grid_remove()
+        else:
+            self.qualityLabel.grid()
+            self.qualityMenu.grid()
+
+
+    """ yt-dlp's own __version__ (e.g. "2026.07.04") and PyPI's info.version (e.g. "2026.7.4") are
+    the SAME release formatted differently — comparing them as strings says they differ forever,
+    even right after updating. Parse into an int tuple so equal versions compare equal. """
+    @staticmethod
+    def _parseVersionTuple(versionString):
+        return tuple(int(part) for part in re.split(r'\D+', versionString) if part != '')
+
+
+    """ Checks PyPI for a newer yt-dlp release — notify only, never auto-installs. Runs on a
+    background thread at startup; any failure (offline, PyPI down, unexpected response shape) is
+    swallowed silently so a flaky network never disrupts opening the app. """
+    def checkYtDlpUpdate(self):
+        try:
+            response = requests.get("https://pypi.org/pypi/yt-dlp/json", timeout=5)
+            latestVersion = response.json()["info"]["version"]
+            if self._parseVersionTuple(latestVersion) > self._parseVersionTuple(yt_dlp.version.__version__):
+                self.root.after(0, self.showUpdateNotice, latestVersion)
+        except Exception:
+            pass
+
+
+    """ Lights up the (always-present, normally blank/disabled) notice button in optionsRow """
+    def showUpdateNotice(self, latestVersion):
+        self.updateNoticeButton.configure(text=f"yt-dlp {latestVersion} available", state="normal", fg_color="#191818")
+
+
+    """ Runs the actual update when the user clicks the notice — packaged .exe builds have no pip
+    to call, so those just get an informational message instead of an update attempt. """
+    def onUpdateNoticeClick(self):
+        if getattr(sys, 'frozen', False):
+            messagebox.showinfo("Update yt-dlp", "This is a packaged .exe — it can't run pip from inside itself. Rebuild the .exe with a newer yt-dlp installed, or check the yt-dlp GitHub releases page.")
+            return
+
+        self.updateNoticeButton.configure(state="disabled", text="Updating...")
+        threading.Thread(target=self._runYtDlpUpdate, daemon=True).start()
+
+
+    def _runYtDlpUpdate(self):
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-U", "yt-dlp"],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode == 0:
+                message = "yt-dlp updated. Restart MP3Vault for the change to take effect."
+            else:
+                message = f"Update failed:\n{result.stderr[-500:]}"
+        except Exception as e:
+            message = f"Update failed: {e}"
+
+        self.root.after(0, lambda: messagebox.showinfo("Update yt-dlp", message))
+        self.root.after(0, lambda: self.updateNoticeButton.configure(state="disabled", text=""))
+
+
+
+    # NOTE: the "|" between these first two lines is required — without it Python's adjacent-string
+    # concatenation turns them into a single 2-char sequence pattern instead of an OR, and invalid
+    # filename chars like : ? " < > | stop being stripped from downloaded titles.
     VALID_FILENAME_CHARS = re.compile(
         r'[^\w\s\-\'.()&,]'  # Caracteres no permitidos
-        r'[\\/:*?"<>|]' # Caracteres no válidos en nombres de archivo
+        r'|[\\/:*?"<>|]' # Caracteres no válidos en nombres de archivo
         r'|\(Official Audio\)'  # Elimina "(Official Audio)"
         r'|\(\s-\sTopic\)'  # Elimina "( - Topic)"
         r'|\(official\)'  # Elimina "(official)" (case-sensitive)
@@ -106,12 +187,101 @@ class MP3Vault:
         r'|\(\)',  # Elimina paréntesis vacíos "()"
     )
 
+    # Accepts youtube.com/youtu.be with or without a www./m./music. subdomain, http or https,
+    # watch/shorts links for single videos, and playlist links.
+    YOUTUBE_VIDEO_URL_RE = re.compile(
+        r'^https?://(?:www\.|m\.|music\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)(?P<id>[\w-]+)'
+    )
+    YOUTUBE_PLAYLIST_URL_RE = re.compile(
+        r'^https?://(?:www\.|m\.|music\.)?youtube\.com/playlist\?list='
+    )
+
+    # Window width is fixed at 750 and never resizes (root.resizable(0, 0)), so the space actually
+    # left for the title after the 200px thumbnail, fixed paddings, and the Edit button is a
+    # constant too — measured directly from the real widget tree (see conversation/commit notes).
+    # CTkLabel needs wraplength AND width set to the same value: wraplength alone still leaves the
+    # widget's own canvas at its small default size, and grid can silently shrink a too-large width
+    # to fit its column — either mismatch clips the wrapped text instead of showing it in full.
+    TITLE_WRAPLENGTH_SINGLE = 340   # single-video view: Edit button shares the same inner frame
+    TITLE_WRAPLENGTH_PLAYLIST = 385  # playlist view: Edit button lives in a separate outer column
 
     """ Clean a filename by removing special characters based on a regex pattern """
     def cleanFilename(self, filename: str):
         return re.sub(self.VALID_FILENAME_CHARS, "", filename).strip()
     
-    
+    def cleanUploader(self, filename: str):
+        # Lista de sufijos comunes que queremos eliminar del nombre
+        unwanted_suffixes = [
+            " - Topic",
+            " - Official",
+            " - YouTube",
+            " - VEVO",
+            " - Lyrics",
+        ]
+
+        # Elimina cada sufijo si está presente
+        for suffix in unwanted_suffixes:
+            if suffix in filename:
+                filename = filename.replace(suffix, "")
+
+        # Aplica limpieza con regex para caracteres especiales y etiquetas
+        cleaned = re.sub(self.VALID_FILENAME_CHARS, "", filename).strip()
+        return cleaned
+
+
+    """ Single source of truth for the final filename a single-video download will produce —
+    used both to predict it BEFORE downloading (duplicate-file check) and to build it after
+    (downloadAudio). Keeping this in one place means the prediction can never drift out of sync
+    with the real result, unlike the substring-search bug fixed earlier this session. """
+    def buildCleanTitleAndFilename(self, uploader: str, title: str):
+        invalidChars = r'[<>:"/\\|?*]'
+        cleanTitle = re.sub(invalidChars, '', self.cleanFilename(title))
+
+        # Use regular expressions to remove duplicate uploader names at the beginning of the filename
+        pattern = rf"^(?:{re.escape(uploader)}\s*-\s*)+"
+        remainder = re.sub(pattern, "", cleanTitle)
+
+        finalFilename = f"{uploader} - {remainder}.{self.audioFormatVar.get()}"
+        return cleanTitle, finalFilename
+
+
+    """ Predicts the filename a PLAYLIST-mode download will produce for one video — mirrors the
+    actual per-entry rename logic in downloadPlaylist, which (unlike downloadAudio) does NOT run
+    the title through cleanFilename/VALID_FILENAME_CHARS, only deduping a leading uploader prefix
+    on yt_dlp's own sanitized title. Predicting with buildCleanTitleAndFilename's cleaner scheme
+    here would silently miss every already-downloaded playlist track (verified: it did). """
+    def predictPlaylistFilename(self, uploaderClean: str, rawTitle: str):
+        baseFilename = yt_dlp.utils.sanitize_filename(rawTitle, restricted=False)
+        generatedFilename = f"{baseFilename}.{self.audioFormatVar.get()}"
+        pattern = rf"^(?:{re.escape(uploaderClean)}\s*-\s*)+"
+        remainder = re.sub(pattern, "", generatedFilename)
+        return f"{uploaderClean} - {remainder}"
+
+
+    """ Builds the yt_dlp postprocessors list for the currently selected format/quality """
+    def buildAudioPostprocessors(self):
+        audioFormat = self.audioFormatVar.get()
+
+        postprocessors = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': audioFormat,
+        }]
+        # Bitrate is meaningless for lossless/uncompressed formats — omitting preferredquality
+        # there lets FFmpegExtractAudio use its own lossless default instead of misapplying a kbps
+        # target to flac/wav.
+        if audioFormat not in ('flac', 'wav'):
+            postprocessors[0]['preferredquality'] = self.audioQualityVar.get()
+
+        postprocessors.append({'key': 'FFmpegMetadata'})  # Añade metadatos
+
+        # WAV has no standard place to embed cover art, so skip the thumbnail steps entirely for it
+        if audioFormat != 'wav':
+            postprocessors.append({'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg'})
+            postprocessors.append({'key': 'EmbedThumbnail'})
+
+        return postprocessors
+
+
     """ Start a new thread to fetch video information when a URL is provided """
     def threadingButton(self, url: str):
         if url:
@@ -139,21 +309,22 @@ class MP3Vault:
             self.resetToDefault(isEmpty=True) 
             return  
             
-        if url.startswith("https://www.youtube.com/watch?v=") or url.startswith("https://youtu.be/"):
+        video_match = self.YOUTUBE_VIDEO_URL_RE.match(url)
+        if video_match:
             self.isPlaylist = False
-            
+
             # Extract the video ID and validate its length
-            video_id = url.split("watch?v=")[-1] if "watch?v=" in url else url.split("youtu.be/")[-1]
+            video_id = video_match.group("id")
             if len(video_id) < 11:
                 self.displayMessage("The YouTube video ID is incomplete or truncated.")
                 return
-            
+
             self.downloadBtn.configure(state="normal")
             self.threadingButton(url)
 
-        elif url.startswith("https://www.youtube.com/playlist"):
-            self.isPlaylist = True  
-            self.downloadBtn.configure(state="normal")  
+        elif self.YOUTUBE_PLAYLIST_URL_RE.match(url):
+            self.isPlaylist = True
+            self.downloadBtn.configure(state="normal")
             self.threadingButton(url)
         else:
             self.isPlaylist = None
@@ -165,41 +336,44 @@ class MP3Vault:
     def fetchVideoInfo(self, url: str):
          # Store the video URL and set youtube-dl options
         self.videoUrl = url
-        self.ydl_opts = {
+        # Local var, not self.ydl_opts: fetchVideoInfo can be re-triggered in a new thread while
+        # a download thread is still running, and a shared instance attribute would race between them.
+        ydl_opts = {
             'quiet': True,
             'extract_flat': True,
             'socket_timeout': 10
         }
 
         try:
-            with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info_video = ydl.extract_info(url, download=False)
 
-                
+
                 self.root.after(0, self.getInfoVideo, info_video)
-                
+
         # Handle specific download errors from yt_dlp
+        # This except block runs on the worker thread, so every UI call is routed through root.after
         except yt_dlp.utils.DownloadError as e:
             errorMsg = str(e)
-            
+
             if "HTTP Error 400" in errorMsg:
-                self.displayMessage("Bad request (Error 400). Please check the URL.")
+                self.root.after(0, self.displayMessage, "Bad request (Error 400). Please check the URL.")
             elif "HTTP Error 404" in errorMsg:
-                self.displayMessage("Video not found (Error 404).")
+                self.root.after(0, self.displayMessage, "Video not found (Error 404).")
             elif "HTTP Error 403" in errorMsg:
-                self.displayMessage("Access denied (Error 403).")
+                self.root.after(0, self.displayMessage, "Access denied (Error 403).")
             elif "HTTP Error 500" in errorMsg:
-                self.displayMessage("Internal server error (Error 500).")
+                self.root.after(0, self.displayMessage, "Internal server error (Error 500).")
             elif "youtube:truncated_id" in errorMsg:
-                self.displayMessage("The YouTube video ID is incomplete or truncated.")
+                self.root.after(0, self.displayMessage, "The YouTube video ID is incomplete or truncated.")
             elif "Video unavailable" in errorMsg:
-                self.displayMessage("The YouTube video ID is unavailable.")
+                self.root.after(0, self.displayMessage, "The YouTube video ID is unavailable.")
             else:
-                self.displayMessage(f"Error retrieving video information: {errorMsg}")
-           
-                
+                self.root.after(0, self.displayMessage, f"Error retrieving video information: {errorMsg}")
+
+
         except Exception as e:
-            self.displayMessage(f"❌ Error inesperado: {str(e)}")
+            self.root.after(0, self.displayMessage, f"Unexpected error: {str(e)}")
             
    
     """ Clears the URL input field and resets UI elements """
@@ -212,47 +386,79 @@ class MP3Vault:
             self.noURL()
             
             
-    """ Determines whether to download a single video or a playlist """        
+    """ Determines whether to download a single video or a playlist """
     def conditionalDownload(self):
         if self.isPlaylist is None:
             return
-       
+
+        if not self.downloadPath:
+            messagebox.showwarning("Warning", "Please select a download folder first.")
+            return
+
+        # Runs on the main thread (conditionalDownload isn't a worker thread), so a blocking
+        # askyesno here is safe — no root.after needed, unlike everything inside the download threads.
+        if not self.isPlaylist:
+            _, predictedName = self.buildCleanTitleAndFilename(self.artistAudioVar.get(), self.titleAudioVar.get())
+            predictedPath = os.path.join(os.path.normpath(self.downloadPath), predictedName)
+            if os.path.exists(predictedPath):
+                if not messagebox.askyesno("Already downloaded", f'"{predictedName}" already exists in that folder. Download again and overwrite it?'):
+                    return
+
+        # Prevents a double-click from starting two overlapping download threads on the same file
+        if getattr(self, "isDownloading", False):
+            return
+        self.isDownloading = True
+        self.cancelRequested.clear()
+
         if self.isPlaylist:
             threading.Thread(target=self.downloadPlaylist, daemon=True).start()
         else:
-            
+
             threading.Thread(target=self.downloadAudio, daemon=True).start()
         
                     
             
-    """ Update metadata for an MP3 file using the provided information """
+    """ Update metadata for an audio file using the provided information """
     def updateMetadata(self, title: str, artist: str, album: str, audioWithNoMetadata: str, downloadPath: str, customFileName=None):
+        # Called from the download worker threads (downloadAudio/downloadPlaylist), so any
+        # displayMessage here must go through root.after rather than touching widgets directly.
         filePath = os.path.join(downloadPath, audioWithNoMetadata)
-        #print('Ruta completa:', filePath)  # Para depuración
 
         if not os.path.exists(filePath):
-            self.displayMessage(f"Error: File not found - {filePath}")
+            self.root.after(0, self.displayMessage, f"Error: File not found - {filePath}")
+            return
+
+        # mutagen has no single tag class that covers every format — EasyID3 only understands
+        # ID3 (mp3), EasyMP4 only MP4 atoms (m4a), FLAC only Vorbis comments. WAV has no
+        # well-supported standard tagging scheme, so we skip tagging it rather than fail or write
+        # something most players won't read back.
+        ext = os.path.splitext(filePath)[1].lower()
+        if ext == ".wav":
             return
 
         try:
-            # Ensure values are not None before assigning metadata 
-            audioMetadata = EasyID3(filePath)
-            
+            if ext == ".mp3":
+                audioMetadata = EasyID3(filePath)
+            elif ext == ".m4a":
+                audioMetadata = EasyMP4(filePath)
+            elif ext == ".flac":
+                audioMetadata = FLAC(filePath)
+            else:
+                return
+
             audioMetadata['title'] = customFileName or title
             audioMetadata['artist'] = artist
             audioMetadata['albumartist'] = artist
             audioMetadata['album'] = str(album)
-            
+
             audioMetadata.save()
-            
+
         except Exception as e:
-            self.displayMessage(f"Error updating metadata: {e}")
+            self.root.after(0, self.displayMessage, f"Error updating metadata: {e}")
 
 
     """ Handles video information retrieval and processes accordingly """
     def getInfoVideo(self, info_video: str):
-        global videoInPlaylist
-        
          # If the URL contains 'list=', it's a playlist
         if "list=" in self.videoUrl:
             self.videoInPlaylist = self.videoUrl.split("&list=")[0]
@@ -279,11 +485,11 @@ class MP3Vault:
         self.playlistTitle  = info_video.get('title')
         self.playlistAlbum  = info_video.get('album', self.playlistTitle)
         self.playlistChannel = (
-            info_video.get("channel") 
-            or (info_video["entries"][0].get("channel") if info_video.get("entries") else "Not available")
+            info_video.get("channel")
+            or (info_video["entries"][0].get("channel") if info_video.get("entries") else "")
         )
         self.playlistArtist = info_video.get('artist', self.playlistChannel)
-        self.albumArtistVideo = info_video.get('uploader', 'Not available')
+        self.albumArtistVideo = info_video.get('uploader', '')
         
          # Extract the first available thumbnail URL, if present
         self.playlist_thumbnail  = (
@@ -310,46 +516,61 @@ class MP3Vault:
     """ Handles processing of a single video """    
     def handleSingleVideoInfo(self, info_video: str):                                        
         self.title_video = info_video.get('title').strip()
-        self.album_video = info_video.get('album', 'Not available')
-        self.channel_video = info_video.get('channel', 'Not available')
+        self.album_video = info_video.get('album', '')
+        self.channel_video = info_video.get('channel', '')
         self.artist_video = info_video.get('artist', self.channel_video)
         self.album_thumbnail = info_video.get('thumbnail') 
         self.updateVideoInfo(self.album_thumbnail)
         
     
-    """ Extracts video information from a playlist """    
-    def getVideoFromPlaylist(self, videoInPlaylist: str):   
-        with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
+    """ Extracts video information from a playlist """
+    def getVideoFromPlaylist(self, videoInPlaylist: str):
+        # Own local options dict, not self.ydl_opts — see the note in fetchVideoInfo about the race.
+        ydl_opts = {
+            'quiet': True,
+            'extract_flat': True,
+            'socket_timeout': 10
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_video_in_playlist = ydl.extract_info(videoInPlaylist, download=False)
             self.title_video = info_video_in_playlist.get('title').strip()
-            self.album_video = info_video_in_playlist.get('album', 'Not available')
-            self.channel_video = info_video_in_playlist.get('channel', 'Not available')
+            self.album_video = info_video_in_playlist.get('album', '')
+            self.channel_video = info_video_in_playlist.get('channel', '')
             self.artist_video = info_video_in_playlist.get('artist', self.channel_video)
             self.album_thumbnail = info_video_in_playlist.get('thumbnail')
             self.updateVideoInfo(self.album_thumbnail)
         
     
-    """ Closes the pop-up window for editing playlist information """    
-    def closeEditInfoPopUp(self): 
-        newPlaylistTitleAudio = self.titleEditUrlEntry.get()     
-        self.playlistTitleAudio = self.titleAudioVar.set(newPlaylistTitleAudio)
+    """ Closes the pop-up window for editing playlist information """
+    def closeEditInfoPopUp(self):
+        # Write the popup's own vars back into the real ones, then let them (and their entries'
+        # variable traces) get garbage-collected with the window instead of leaking into it.
+        self.titleAudioVar.set(self.titleEditUrlEntry.get())
+        self.artistAudioVar.set(self.artistEditUrlEntry.get())
+        self.albumAudioVar.set(self.albumEditUrlEntry.get())
         self.editInfoWindow.destroy()
-        
-        
+
+
     """ Opens a pop-up window to edit the playlist information """
     def editInfoPopUp(self):
         if self.editInfoWindow and self.editInfoWindow.winfo_exists():
             self.editInfoWindow.lift()
             return
-        
+
         self.editInfoWindow = ctk.CTkToplevel(self.root)
         self.editInfoWindow.geometry("410x250")
         self.editInfoWindow.title("Edit audio details")
-        
-        self.titleEditUrlEntry = self.titleAudioVar
-        self.artistEditUrlEntry = self.artistAudioVar
-        self.albumEditUrlEntry = self.albumAudioVar
-        
+
+        # Separate StringVars scoped to this popup, seeded from the current values — NOT the same
+        # titleAudioVar/artistAudioVar/albumAudioVar the main window's labels use. CTkEntry never
+        # removes its internal trace on its textvariable when destroyed, so binding these entries
+        # directly to the long-lived vars left a dangling trace on every popup open/close that later
+        # crashed with `_tkinter.TclError: invalid command name` the next time a new video loaded
+        # and the shared var's .set() fired the stale callback.
+        self.titleEditUrlEntry = ctk.StringVar(value=self.titleAudioVar.get())
+        self.artistEditUrlEntry = ctk.StringVar(value=self.artistAudioVar.get())
+        self.albumEditUrlEntry = ctk.StringVar(value=self.albumAudioVar.get())
+
         self.editInfoUrlFrame = ctk.CTkFrame(self.editInfoWindow, fg_color="transparent")
         self.editInfoUrlFrame.grid(row=0, column=0, sticky='nsew', padx=self.padding, pady=self.padding)
         self.editInfoUrlFrame.columnconfigure((0, 3), weight=1) 
@@ -375,7 +596,7 @@ class MP3Vault:
         self.artistEditLabel.configure(text_color="#FFFFFF", font=self.regularFont, pady=1);
         self.artistEditLabel.grid(row=2, column=0, sticky='nsew', padx=(0, 10))
 
-        self.artistEditUrlInput = ctk.CTkEntry(self.editInfoUrlFrame, textvariable=self.artistAudioVar)
+        self.artistEditUrlInput = ctk.CTkEntry(self.editInfoUrlFrame, textvariable=self.artistEditUrlEntry)
         self.artistEditUrlInput.grid(row=2, column=1, pady=10, sticky='nsew')
         self.artistEditUrlInput.configure(font=self.regularFont, text_color="#000000", fg_color="#FFFFFF", width=300, height=30)
         
@@ -385,7 +606,7 @@ class MP3Vault:
         self.albumEditLabel.configure(text_color="#FFFFFF", font=self.regularFont, pady=1);
         self.albumEditLabel.grid(row=3, column=0, sticky='nsew', padx=(0, 10))
 
-        self.albumEditUrlInput = ctk.CTkEntry(self.editInfoUrlFrame, textvariable=self.albumAudioVar)
+        self.albumEditUrlInput = ctk.CTkEntry(self.editInfoUrlFrame, textvariable=self.albumEditUrlEntry)
         self.albumEditUrlInput.grid(row=3, column=1, pady=10, sticky='nsew')
         self.albumEditUrlInput.configure(font=self.regularFont, text_color="#000000", fg_color="#FFFFFF", width=300, height=30)
         
@@ -397,236 +618,429 @@ class MP3Vault:
 
     """ Handles the progress tracking of a download """
     def _progress_hook(self, d):
+        # Runs on the download worker thread (not Tk's main thread) — raising here is yt_dlp's
+        # documented way to abort a download cleanly from inside a progress hook.
+        if self.cancelRequested.is_set():
+            raise yt_dlp.utils.DownloadCancelled("Cancelled by user")
+
+        # hand off to _updateProgressUI via root.after so widget access stays on the main thread.
+        self.root.after(0, self._updateProgressUI, d)
+
+    def _updateProgressUI(self, d):
         # If downloading from a playlist, get the dynamic title
         if 'playlist_index' in d and d['playlist_index'] is not None:
             currentIndex = d['playlist_index']  # Video number in the playlist
             totalVideos = d.get('playlist_count', 1)  # Total number of videos
             title = f"{self.playlist_videos[currentIndex - 1]['title']} ({currentIndex}/{totalVideos})"
         else:
-            title = self.titleAudioVar.get() 
-        
-        # Remove ANSI escape sequences from speed and ETA
-        speed = re.sub(r'\x1b\[[0-9;]*m', '', d['_speed_str']).strip() 
+            title = self.titleAudioVar.get()
+
+        # Remove ANSI escape sequences from speed and ETA (not every progress dict has these keys)
+        speed = re.sub(r'\x1b\[[0-9;]*m', '', d.get('_speed_str', '')).strip()
         eta = re.sub(r'\x1b\[[0-9;]*m', '', d.get('_eta_str', 'N/A')).strip()
 
         if d['status'] == 'downloading':
-            percent_str = re.sub(r'\x1b\[[0-9;]*m', '', d['_percent_str'])
+            percent_str = re.sub(r'\x1b\[[0-9;]*m', '', d.get('_percent_str', '0%'))
             percent = float(percent_str.strip('%'))  # Convert percentage to decimal (0-1)
             self.progressVar.set(percent / 100)  # Update progress bar variable
             self.progressBar.update_idletasks()  # Refresh the UI
 
             self.progressLabel.configure(text=f"Descargando: {title}")
             self.speedLabel.configure(text=f"Velocidad: {speed} - ETA: {eta}")
-        
+
         elif d['status'] == 'finished':
             self.progressLabel.configure(text=f"Descarga completada: {title}")
             self.speedLabel.configure(text="¡Completado!")
             self.progressVar.set(1)  # Set progress bar to 100%
            
    
-    """ Initiates audio download from a given URL """
-    def downloadAudio(self):   
-        self.videoUrl = self.urlInput.get()
-        
-        if "list=" in self.videoUrl:
-            self.videoUrl = self.videoInPlaylist
-            
-        self.root.after(0, self.show_progress_frame)
-        
-        title = self.titleAudioVar.get()
-        uploader = self.artistAudioVar.get()
-        album = self.albumAudioVar.get()
-
-        self.ydl_opts = {
+    """ Downloads and tags a single video URL — the shared core reused by downloadAudio (single-URL
+    button) and, per-item, by the URL queue. Returns a dict rather than showing its own success
+    popup, so a caller processing many URLs (the queue) can show ONE combined summary instead of
+    one messagebox per item. """
+    def _downloadSingleUrl(self, url: str, title: str, uploader: str, album: str):
+        audioFormat = self.audioFormatVar.get()
+        ydl_opts = {
             'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            },
-            {
-            'key': 'FFmpegMetadata'  # Añade metadatos
-            }],
+            'writethumbnail': audioFormat != 'wav',
+            'postprocessors': self.buildAudioPostprocessors(),
             'noplaylist': True,
             'progress_hooks': [self._progress_hook],
             'extract_flat': 'in-playlist',
             'nocolor': True,
             "outtmpl": f'{self.downloadPath}/%(title)s.%(ext)s',
         }
-        
-        try:
-            with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
-                info_downloaded = ydl.extract_info(self.videoUrl, download=True)
 
-                # Remove invalid characters from title
-                invalidChars = r'[<>:"/\\|?*]'
-                cleanTitle = re.sub(invalidChars, '', self.cleanFilename(title))
-                
-                # Use regular expressions to remove duplicate uploader names at the beginning of the filename
-                pattern = rf"^(?:{re.escape(uploader)}\s*-\s*)+"
-                remainder = re.sub(pattern, "", cleanTitle) 
-                
-                ext = "mp3"  
-                finalFilename = f"{uploader} - {remainder}.{ext}"
-                
+        # Snapshot so a cancellation mid-download can clean up the .part/.webp/etc it leaves behind
+        # (verified: yt_dlp doesn't clean these up itself when aborted via DownloadCancelled).
+        download_path_before_dl = os.path.normpath(self.downloadPath)
+        filesBeforeDl = set(os.listdir(download_path_before_dl)) if os.path.isdir(download_path_before_dl) else set()
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info_downloaded = ydl.extract_info(url, download=True)
+
+                cleanTitle, finalFilename = self.buildCleanTitleAndFilename(uploader, title)
+
                 # Build file path
                 download_path = os.path.normpath(self.downloadPath)  # Ensure a valid path format
                 file_path = os.path.join(download_path, finalFilename)  # Complete file path
-                
-                 # Search for the downloaded file in the directory and rename it if necessary
-                for file in os.listdir(download_path):
-                    if file.endswith(".mp3") and cleanTitle in file:
-                        old_filepath = os.path.join(download_path, file)  # Path of the downloaded file
-                        if old_filepath != file_path:  # Check if the name is already correct
-                            os.rename(old_filepath, file_path)  # Rename the file properly
-                            print(f"✅ File renamed successfully: {file_path}")
-                        break  # Stop searching once the file is found
-            
-                
-                if os.path.exists(file_path):
-                    self.updateMetadata(
-                        cleanTitle, 
-                        uploader, 
-                        album, 
-                        finalFilename, 
-                        self.downloadPath
-                    )
+
+                # yt-dlp names the file after the ORIGINAL video title, not our (possibly edited)
+                # title/artist — searching the folder for `cleanTitle` as a substring silently fails
+                # whenever the user edits the title in the popup, since the edited text then shares
+                # nothing with the real downloaded filename. ydl.prepare_filename() gives the exact
+                # name yt-dlp actually wrote (same approach downloadPlaylist already uses).
+                downloadedFilename = os.path.basename(ydl.prepare_filename(info_downloaded))
+                downloadedFilename = os.path.splitext(downloadedFilename)[0] + f".{audioFormat}"
+                old_filepath = os.path.join(download_path, downloadedFilename)
+
+                if os.path.exists(old_filepath):
+                    # os.replace (not os.rename) because on Windows os.rename raises
+                    # FileExistsError if file_path already exists (e.g. re-downloading a track)
+                    if old_filepath != file_path:
+                        os.replace(old_filepath, file_path)
+                        print(f"File renamed successfully: {file_path}")
+                    else:
+                        print(f"No renaming needed, using: {file_path}")
                 else:
-                    print("❌ Error: Downloaded file not found.")
-                
-                print(f"Downloaded: {finalFilename}")
-                messagebox.showinfo("Download Success", f"{finalFilename} - Downloaded Successfully")
-                
-            # 🔹 Ocultar ProgressBar al finalizar
-            self.root.after(0, self.hide_progress_frame)
+                    print(f"Error: Expected downloaded file not found: {old_filepath}")
+
+                if os.path.exists(file_path):
+                    self.updateMetadata(cleanTitle, uploader, album, finalFilename, self.downloadPath)
+                    print(f"Downloaded: {finalFilename}")
+                    return {"success": True, "filename": finalFilename, "error": None}
+                else:
+                    return {"success": False, "filename": None, "error": "Downloaded file not found."}
+
+        except yt_dlp.utils.DownloadCancelled:
+            # Best-effort cleanup of whatever partial/temp files this attempt left behind
+            # (.part, .ytdl, thumbnail, etc.) — one failed removal shouldn't stop the rest.
+            filesAfterDl = set(os.listdir(download_path_before_dl)) if os.path.isdir(download_path_before_dl) else set()
+            for newFile in filesAfterDl - filesBeforeDl:
+                try:
+                    os.remove(os.path.join(download_path_before_dl, newFile))
+                except OSError:
+                    pass
+            return {"success": False, "filename": None, "error": None, "cancelled": True}
 
         except Exception as e:
-                #messagebox.showerror("Error", str(e))
-                #print(f"An error occurred: {e}")
-                self.displayMessage(f"An error occurred: {e}")
-   
-   
-    """ Downloads selected videos from a playlist """             
-    def downloadPlaylist(self):   
-        self.videoUrl = self.urlInput.get()
-        uploader = self.artistAudioVar.get().strip()
-        album = self.albumAudioVar.get()
-        
-        # Validates if at least one video is selected before proceeding with download
-        if not any(state.get() for state in self.checkboxStates):
-            messagebox.showwarning("Warning", "Please select at least one video to download.")
-            return
-        
-        # Schedules the transition to the progress frame in the main event loop
-        self.root.after(0, self.show_progress_frame)
-        
-        #  Retrieve the indices of selected videos
-        selected_indices = [
-            str(i + 1)   #Convert 0-based indices to 1-based
-            for i, state in enumerate(self.checkboxStates)
-            if state.get()
-        ]
-        
-        # Ensures that at least one video is selected before proceeding
-        if not selected_indices:
-            messagebox.showwarning("Warning", "No videos selected for download.")
-            return
-        
-        # Joins selected indices into a comma-separated string for further processing
-        playlistItems = ",".join(selected_indices)
+            return {"success": False, "filename": None, "error": str(e)}
 
-        self.ydl_opts = {
-            'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            },
-            {
-            'key': 'FFmpegMetadata'  # Añade metadatos
-            }],
-            
-            'add_metadata': True,
-            'socket_timeout': 60,
-            'progress_hooks': [self._progress_hook],
-            "outtmpl": f'{self.downloadPath}/%(title)s.%(ext)s',
-            'playlist_items': playlistItems,  # Descargar solo los videos seleccionados
-        }
-        
+
+    """ Initiates audio download from a given URL """
+    def downloadAudio(self):
+        self.videoUrl = self.urlInput.get()
+
+        if "list=" in self.videoUrl:
+            self.videoUrl = self.videoInPlaylist
+
+        self.root.after(0, self.show_progress_frame)
+
+        title = self.titleAudioVar.get()
+        uploader = self.artistAudioVar.get()
+        album = self.albumAudioVar.get()
+
         try:
-            #print(f'El valor de "outtmpl" es: {self.ydl_opts["outtmpl"]}')
-            with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
+            result = self._downloadSingleUrl(self.videoUrl, title, uploader, album)
+
+            if result["success"]:
+                self.root.after(0, lambda: messagebox.showinfo("Download Success", f"{result['filename']} - Downloaded Successfully"))
+            elif result.get("cancelled"):
+                self.root.after(0, self.displayMessage, "Download cancelled.")
+            else:
+                self.root.after(0, self.displayMessage, f"An error occurred: {result['error']}")
+
+            # Ocultar ProgressBar al finalizar
+            self.root.after(0, self.hide_progress_frame)
+
+        finally:
+            self.isDownloading = False
+   
+   
+    """ Downloads selected videos from a playlist """
+    def downloadPlaylist(self):
+        # Wrapping the whole method in try/finally (instead of just around the yt-dlp call)
+        # guarantees isDownloading resets even on the early-return guard clauses below.
+        try:
+            self.videoUrl = self.urlInput.get()
+            uploader = self.artistAudioVar.get().strip()
+            album = self.albumAudioVar.get()
+
+            # Validates if at least one video is selected before proceeding with download
+            if not any(state.get() for state in self.checkboxStates):
+                self.root.after(0, lambda: messagebox.showwarning("Warning", "Please select at least one video to download."))
+                return
+
+            # Schedules the transition to the progress frame in the main event loop
+            self.root.after(0, self.show_progress_frame)
+
+            # Predicts each selected video's final filename (same helper as the single-video check)
+            # and skips any that already exist — asking per-song would be impractical for a
+            # multi-track playlist, so this auto-skips instead of prompting.
+            uploaderClean = self.cleanUploader(uploader)
+            download_path_check = os.path.normpath(self.downloadPath)
+            selected_indices = []
+            skippedExisting = 0
+            for i, state in enumerate(self.checkboxStates):
+                if not state.get():
+                    continue
+                predictedName = self.predictPlaylistFilename(uploaderClean, self.playlist_videos[i]['title'])
+                if os.path.exists(os.path.join(download_path_check, predictedName)):
+                    skippedExisting += 1
+                else:
+                    selected_indices.append(str(i + 1))  # Convert 0-based index to 1-based
+
+            # Ensures that at least one video is selected before proceeding
+            if not selected_indices:
+                if skippedExisting:
+                    self.root.after(0, lambda: messagebox.showinfo("Nothing to download", f"All {skippedExisting} selected song(s) already exist in that folder."))
+                else:
+                    self.root.after(0, lambda: messagebox.showwarning("Warning", "No videos selected for download."))
+                return
+
+            # Joins selected indices into a comma-separated string for further processing
+            playlistItems = ",".join(selected_indices)
+
+            audioFormat = self.audioFormatVar.get()
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'writethumbnail': audioFormat != 'wav',
+                'postprocessors': self.buildAudioPostprocessors(),
+                'add_metadata': True,
+                'socket_timeout': 60,
+                'progress_hooks': [self._progress_hook],
+                "outtmpl": f'{self.downloadPath}/%(title)s.%(ext)s',
+                'playlist_items': playlistItems,  # Descargar solo los videos seleccionados
+            }
+
+            # yt-dlp writes a thumbnail for the playlist itself (not just each video), and nothing
+            # ever embeds/deletes that one — snapshot the folder now so we can remove it afterwards
+            # without having to guess yt-dlp's own filename-sanitizing rules for the playlist title.
+            download_path_before = os.path.normpath(self.downloadPath)
+            filesBeforeDownload = set(os.listdir(download_path_before)) if os.path.isdir(download_path_before) else set()
+
+            downloadedCount = 0
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 playlist_info = ydl.extract_info(self.videoUrl, download=True)
                 if "entries" in playlist_info:
                     # If the URL is a playlist, we loop through each video in the playlist
                     for video in playlist_info["entries"]:
                         title = video.get('title', 'Desconocido').strip()
 
+                        uploader = self.cleanUploader(uploader)
                         # Extracts the base name of the file, removing path info
                         generatedFilename = os.path.basename(ydl.prepare_filename(video)).strip()
-                        
-                        # Change the file extension to .mp3 if the conversion was successful
-                        generatedFilename = generatedFilename.replace(".webm", ".mp3").replace(".m4a", ".mp3")
+                        # Change the file extension to match the selected output format
+                        baseFilename = os.path.splitext(generatedFilename)[0]
+                        generatedFilename = baseFilename + f".{audioFormat}"
 
-                        
                         # Use regular expressions to remove duplicate uploader names at the beginning of the filename
                         pattern = rf"^(?:{re.escape(uploader)}\s*-\s*)+"
-                        remainder = re.sub(pattern, "", generatedFilename)    
-                        
+                        remainder = re.sub(pattern, "", generatedFilename)
                         # Finalizes the file name by including only one uploader and the remainder of the original filename
                         newFilename = f"{uploader} - {remainder}" # Sets the final filename format
                         newFilename = os.path.basename(newFilename)  # Ensures there is no path info in the filename
-                        
                         # Build the full path for the old and new file names
                         download_path = os.path.normpath(self.downloadPath) # Normalizes the download path
                         old_filepath = os.path.join(download_path, generatedFilename) # Old file path before renaming
                         new_filepath = os.path.join(download_path, newFilename) # New file path after renaming
-                        
-                        # Renames the file if needed, checking if the old and new paths are differen
+
+                        # os.replace (not os.rename) because on Windows os.rename raises
+                        # FileExistsError if new_filepath already exists (e.g. re-downloading a track)
                         if os.path.exists(old_filepath) and old_filepath != new_filepath:
-                            os.rename(old_filepath, new_filepath) # Renames the file if a conflict exists
-                            print("✅ File renamed successfully:", new_filepath)
+                            os.replace(old_filepath, new_filepath) # Renames the file if a conflict exists
+                            print("File renamed successfully:", new_filepath)
                         else:
-                            print("🔹 No renaming needed, using:", new_filepath)
-                        
+                            print("No renaming needed, using:", new_filepath)
+
                         # Use the final filename to update the video metadata
                         filename = new_filepath
 
                         if os.path.exists(filename):
                              # If the file exists, proceed to update its metadata
                             self.updateMetadata(
-                                self.cleanFilename(title),  
+                                self.cleanFilename(title),
                                 uploader,
                                 album,
                                 filename,
                                 self.downloadPath,
                             )
+                            downloadedCount += 1
                         else:
-                            print(f"❌ Error: File not found: {filename}")
-                messagebox.showinfo("Download Success", f"{filename} - Downloaded Successfully")
-                
-            if any(state.get() for state in self.checkboxStates):
-                # 🔹 Ocultar ProgressBar al finalizar
-                self.root.after(0, self.hide_progress_frame)
+                            print(f"Error: File not found: {filename}")
+
+                # Reports a count instead of a single filename — a playlist has many files, and
+                # "entries" can legitimately be empty (e.g. every selected video was deleted/private).
+                skippedSuffix = f" ({skippedExisting} already existed, skipped)" if skippedExisting else ""
+                if downloadedCount:
+                    self.root.after(0, lambda: messagebox.showinfo("Download Success", f"{downloadedCount} song(s) downloaded successfully{skippedSuffix}"))
+                else:
+                    self.root.after(0, lambda: messagebox.showwarning("Warning", "No videos were downloaded."))
+
+            # Clean up the orphaned playlist-level thumbnail (see snapshot comment above) — any
+            # image file that showed up during this download and isn't a per-video thumbnail
+            # (those are already consumed by ThumbnailsConvertor/EmbedThumbnail).
+            filesAfterDownload = set(os.listdir(download_path_before)) if os.path.isdir(download_path_before) else set()
+            for newFile in filesAfterDownload - filesBeforeDownload:
+                if newFile.lower().endswith(('.jpg', '.jpeg', '.webp', '.png')):
+                    try:
+                        os.remove(os.path.join(download_path_before, newFile))
+                    except OSError:
+                        pass
+
+            self.root.after(0, self.hide_progress_frame)
+
+        except yt_dlp.utils.DownloadCancelled:
+            # Cancellation jumps straight here from inside the `with` block, skipping the
+            # thumbnail cleanup above entirely — so it needs to run again here, and also cover
+            # partial audio downloads (.part/.ytdl), not just leftover thumbnail images.
+            filesAfterCancel = set(os.listdir(download_path_before)) if os.path.isdir(download_path_before) else set()
+            for newFile in filesAfterCancel - filesBeforeDownload:
+                try:
+                    os.remove(os.path.join(download_path_before, newFile))
+                except OSError:
+                    pass
+            self.root.after(0, self.displayMessage, "Download cancelled.")
 
         except Exception as e:
-                #messagebox.showerror("Error", str(e))
-                self.displayMessage(f"An error occurred: {e}")
-    
-    
-    """ Adjusts the wrap length of the text inside the video info frame dynamically """            
-    def updateWraplength(self):
-        containerWidth = self.textInsideVideoInfoFrame.winfo_width()
-        
-        # Defines a minimum wrap length to ensure readability 
-        MIN_WRAPLENGTH = 450
-        containerWidth = max(containerWidth, MIN_WRAPLENGTH)
+            self.root.after(0, self.displayMessage, f"An error occurred: {e}")
 
-        # Updates the wrap length of the title label inside the video info frame
-        self.titleVideoInfo.configure(wraplength=containerWidth)
-    
-    
-    """ Updates the editable audio information fields with new values """    
+        finally:
+            self.isDownloading = False
+
+
+    """ Opens the popup for pasting multiple video URLs (kept hidden until "+ Agregar" is clicked) """
+    def toggleQueueWindow(self):
+        if getattr(self, "queueWindow", None) and self.queueWindow.winfo_exists():
+            self.queueWindow.lift()
+            return
+
+        self.queueWindow = ctk.CTkToplevel(self.root)
+        self.queueWindow.title("Add multiple URLs")
+        self.queueWindow.geometry("420x300")
+
+        self.queueLabel = ctk.CTkLabel(self.queueWindow, text="Paste one YouTube video URL per line:")
+        self.queueLabel.configure(text_color="#FFFFFF", font=self.regularFont)
+        self.queueLabel.grid(row=0, column=0, padx=20, pady=(20, 5), sticky='w')
+
+        self.queueTextbox = ctk.CTkTextbox(self.queueWindow, width=380, height=180)
+        self.queueTextbox.grid(row=1, column=0, padx=20, pady=5)
+
+        self.queueDownloadButton = ctk.CTkButton(self.queueWindow, text="Download All", command=self.startQueueDownload)
+        self.queueDownloadButton.configure(fg_color="#191818", font=self.regularFont, height=35, hover_color="#FF4C58")
+        self.queueDownloadButton.grid(row=2, column=0, pady=(10, 20))
+
+
+    """ Validates the pasted URLs and kicks off the sequential background download """
+    def startQueueDownload(self):
+        if not self.downloadPath:
+            messagebox.showwarning("Warning", "Please select a download folder first.")
+            return
+
+        if getattr(self, "isDownloading", False):
+            messagebox.showwarning("Warning", "A download is already in progress.")
+            return
+
+        # Only single-video URLs are supported in the queue — a playlist URL here would need its
+        # own per-video checkbox selection, which contradicts keeping this flow simple/headless.
+        urls = []
+        invalidCount = 0
+        playlistCount = 0
+        for line in self.queueTextbox.get("1.0", "end").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            elif self.YOUTUBE_VIDEO_URL_RE.match(line):
+                urls.append(line)
+            elif self.YOUTUBE_PLAYLIST_URL_RE.match(line):
+                playlistCount += 1
+            else:
+                invalidCount += 1
+
+        if not urls:
+            messagebox.showwarning("Warning", "No valid single-video URLs found.")
+            return
+
+        notes = []
+        if invalidCount:
+            notes.append(f"{invalidCount} invalid line(s) ignored")
+        if playlistCount:
+            notes.append(f"{playlistCount} playlist URL(s) ignored (not supported in the queue)")
+        if notes:
+            messagebox.showinfo("Queue", f"Queuing {len(urls)} video(s). " + "; ".join(notes) + ".")
+
+        self.queueWindow.destroy()
+        self.isDownloading = True
+        self.cancelRequested.clear()
+        threading.Thread(target=self._runQueueWorker, args=(urls,), daemon=True).start()
+
+
+    """ Downloads each queued URL sequentially, reusing the same core as the single-URL flow """
+    def _runQueueWorker(self, urls):
+        self.root.after(0, self.show_progress_frame)
+
+        successCount = 0
+        failCount = 0
+        skippedExisting = 0
+        wasCancelled = False
+        total = len(urls)
+
+        for i, url in enumerate(urls, start=1):
+            # Checked here too (not just inside _progress_hook) in case Cancel arrives while
+            # between items — e.g. during the metadata fetch below, which has no progress hook.
+            if self.cancelRequested.is_set():
+                wasCancelled = True
+                break
+
+            self.root.after(0, lambda i=i: self.progressLabel.configure(text=f"Descargando {i}/{total}..."))
+
+            # The queue never touches urlInput/titleAudioVar (those belong to the single-URL flow),
+            # so each item needs its own lightweight metadata fetch — same options as fetchVideoInfo,
+            # but run synchronously here since we're already on a background thread.
+            ydl_opts = {'quiet': True, 'extract_flat': True, 'socket_timeout': 10}
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+            except Exception:
+                failCount += 1
+                continue
+
+            title = (info.get('title') or 'Unknown').strip()
+            channel = info.get('channel', '')
+            artist = info.get('artist', channel)
+            album = info.get('album', '')
+
+            # Same already-downloaded check as the single-URL/playlist flows, auto-skipping rather
+            # than prompting — a queue can have many items, asking per-song isn't practical here either.
+            _, predictedName = self.buildCleanTitleAndFilename(artist, title)
+            if os.path.exists(os.path.join(os.path.normpath(self.downloadPath), predictedName)):
+                skippedExisting += 1
+                continue
+
+            result = self._downloadSingleUrl(url, title, artist, album)
+            if result.get("cancelled"):
+                # Cancel aborts the whole remaining queue, not just the current item — same
+                # simplification as the playlist flow, and consistent with a single Cancel button.
+                wasCancelled = True
+                break
+            elif result["success"]:
+                successCount += 1
+            else:
+                failCount += 1
+
+        summary = "Cancelled. " if wasCancelled else ""
+        summary += f"{successCount} downloaded"
+        if skippedExisting:
+            summary += f", {skippedExisting} already existed (skipped)"
+        if failCount:
+            summary += f", {failCount} failed"
+        self.root.after(0, lambda: messagebox.showinfo("Queue finished", summary))
+        self.root.after(0, self.hide_progress_frame)
+        self.isDownloading = False
+
+
+    """ Updates the editable audio information fields with new values """
     def updateEditInfoAudio(self, title_video: str, artist_video: str, album_video: str):
         self.titleAudioVar.set(title_video)
         self.artistAudioVar.set(artist_video)
@@ -646,18 +1060,16 @@ class MP3Vault:
         # Loads and processes the album thumbnail if available
         if album_thumbnail:
             try:
-                u = urlopen(album_thumbnail)
-                raw_data = u.read()
-                self.image = ImageTk.PhotoImage(data=raw_data)
-                
-                response = requests.get(album_thumbnail)
-                image_pil = Image.open(BytesIO(response.content)) 
-                
+                # timeout= so a slow/unresponsive thumbnail host can't freeze the whole window —
+                # this runs on the Tk main thread via root.after, not a background thread.
+                response = requests.get(album_thumbnail, timeout=5)
+                image_pil = Image.open(BytesIO(response.content))
+
                 target_size = (200, 113)
 
                 # Uses ImageOps.fit to crop and resize the image without distortion
-                image_pil = ImageOps.fit(image_pil, target_size, Image.ANTIALIAS)
-                        
+                image_pil = ImageOps.fit(image_pil, target_size, Image.Resampling.LANCZOS)
+
                 self.imageInsideVideoInfoFrame = ctk.CTkImage(light_image=image_pil, size=(200, 113))
                 self.imageLabelInsideVideoInfoFrame = ctk.CTkLabel(self.singleVideosFrame, image=self.imageInsideVideoInfoFrame, text="")
             except Exception as e:
@@ -689,12 +1101,10 @@ class MP3Vault:
         self.editInfoButton.configure(fg_color="#191818", font=self.regularFont, height=33, width=40, hover_color="#FF4C58");
         self.editInfoButton.grid(row=2, column=3, sticky='se')
 
-        self.titleVideoInfo = ctk.CTkLabel(self.textInsideVideoInfoFrame, wraplength=450, textvariable=self.titleAudioVar, font=self.titleFont )
+        self.titleVideoInfo = ctk.CTkLabel(self.textInsideVideoInfoFrame, width=self.TITLE_WRAPLENGTH_SINGLE, wraplength=self.TITLE_WRAPLENGTH_SINGLE, anchor='w', justify='left', textvariable=self.titleAudioVar, font=self.titleFont )
         self.titleVideoInfo.grid(row=0, column=0, sticky='w')
         self.titleVideoInfo.columnconfigure(0, weight=1)
-        # Actualizar el wraplength dinámicamente después de mostrar el widget
-        self.textInsideVideoInfoFrame.after(100, self.updateWraplength)
-        
+
         self.artistVideoInfo = ctk.CTkLabel(self.textInsideVideoInfoFrame, textvariable=self.artistAudioVar, font=self.regularFont)
         self.artistVideoInfo.grid(row=1, column=0, sticky='w')
         
@@ -714,17 +1124,15 @@ class MP3Vault:
         # Loads and processes the album thumbnail if available
         if album_thumbnail:
             try:
-                u = urlopen(album_thumbnail)
-                raw_data = u.read()
-                self.image = ImageTk.PhotoImage(data=raw_data)
-                
-                response = requests.get(album_thumbnail)
-                image_pil = Image.open(BytesIO(response.content)) 
+                # timeout= so a slow/unresponsive thumbnail host can't freeze the whole window —
+                # this runs on the Tk main thread via root.after, not a background thread.
+                response = requests.get(album_thumbnail, timeout=5)
+                image_pil = Image.open(BytesIO(response.content))
                 target_size = (200, 113)
-                
+
                 # Uses ImageOps.fit to crop and resize the image without distortion
-                image_pil = ImageOps.fit(image_pil, target_size, Image.ANTIALIAS)
-                
+                image_pil = ImageOps.fit(image_pil, target_size, Image.Resampling.LANCZOS)
+
                 self.imageInsideVideoInfoFrame = ctk.CTkImage(light_image=image_pil, size=(200, 113))
                 self.imageLabelInsideVideoInfoFrame = ctk.CTkLabel(self.videosFromPlaylistFrame, image=self.imageInsideVideoInfoFrame, text="")
 
@@ -750,8 +1158,6 @@ class MP3Vault:
                
         self.root.geometry("750x700")
         self.imageLabelInsideVideoInfoFrame.grid(row=0, column=0, sticky='ew', padx=self.padding, pady=self.padding)
-        
-        frame_width = self.videosFromPlaylistFrame.winfo_width()
 
         self.textInsideVideoInfoFrame = ctk.CTkFrame(self.videosFromPlaylistFrame, fg_color="transparent")
         self.textInsideVideoInfoFrame.grid(row=0, column=1, columnspan=3, sticky='w', padx=self.padding, pady=self.padding)
@@ -764,18 +1170,10 @@ class MP3Vault:
         self.editInfoButton.grid(row=0, column=3, sticky='ne')
         
         
-        self.titleVideoInfo = ctk.CTkLabel(self.textInsideVideoInfoFrame, wraplength=450, textvariable=self.titleAudioVar, font=self.titleFont)
+        self.titleVideoInfo = ctk.CTkLabel(self.textInsideVideoInfoFrame, width=self.TITLE_WRAPLENGTH_PLAYLIST, wraplength=self.TITLE_WRAPLENGTH_PLAYLIST, anchor='w', justify='left', textvariable=self.titleAudioVar, font=self.titleFont)
         self.titleVideoInfo.grid(row=0, column=0, sticky='w')
         self.titleVideoInfo.columnconfigure(0, weight=1)
 
-        # Ancho del frame principal
-
-        # Calcular el wraplength dinámico basado en el espacio disponible
-        min_wraplength = 150  # Mínimo ancho permitido
-        max_wraplength = 450  # Máximo ancho permitido
-        available_width = frame_width - (2 * self.padding)  # Espacio total disponible
-        calculated_wraplength = max(min_wraplength, min(available_width, max_wraplength))
-        
         self.artistVideoInfo = ctk.CTkLabel(self.textInsideVideoInfoFrame, textvariable=self.artistAudioVar, font=self.regularFont)
         self.artistVideoInfo.grid(row=1, column=0, sticky='w')
         
@@ -806,7 +1204,7 @@ class MP3Vault:
                 # Lista para almacenar los estados de los CheckBoxes
                 self.checkboxStates = []
                 
-                for i, video in enumerate(self.playlist_videos):
+                for i, video in enumerate(self.playlist_videos, start=1):
                     video_title = video['title']
                     
                     if len(video_title) > maxTextLength:
@@ -900,8 +1298,12 @@ class MP3Vault:
     def show_progress_frame(self):
         for widget in self.videoInfoFrame.winfo_children():
             widget.destroy() # Removes any existing widgets
-        
-        self.root.geometry("750x280")    
+
+        # Taller than the other 280px views — videoInfoFrame splits its height 50/50 between two
+        # weighted rows (this one and the empty-queue row), and the extra Cancel button row no
+        # longer fits in a plain 280px window without overlapping optionsRow/videoConfigFrame below
+        # (measured: 350 is the bare minimum, 380 leaves comfortable margin).
+        self.root.geometry("750x380")
         self.progressVar = ctk.DoubleVar() # Initializes the progress bar variable
         
         self.progressFrame = ctk.CTkFrame(self.videoInfoFrame, fg_color="transparent")
@@ -921,7 +1323,20 @@ class MP3Vault:
 
         self.speedLabel = ctk.CTkLabel(self.progressFrame, text="Speed: - ETA: -")
         self.speedLabel.grid(row=2, column=0, pady=5, columnspan=5)
-        
+
+        # Lives only inside this frame, which is created fresh per download and destroyed by
+        # hide_progress_frame — so "visible only during an active download" comes for free.
+        self.cancelDownloadButton = ctk.CTkButton(self.progressFrame, text="Cancel", command=self.requestCancel)
+        self.cancelDownloadButton.configure(fg_color="#191818", font=self.regularFont, height=30, width=100, hover_color="#FF4C58")
+        self.cancelDownloadButton.grid(row=3, column=0, pady=(5, 0), columnspan=5)
+
+
+    """ Signals the active download thread to stop via _progress_hook, and disables the button
+    immediately so a second click can't fire while the worker thread unwinds. """
+    def requestCancel(self):
+        self.cancelRequested.set()
+        self.cancelDownloadButton.configure(state="disabled", text="Cancelling...")
+
 
     """ Hides the progress frame after the download is completed """
     def hide_progress_frame(self):
@@ -945,9 +1360,40 @@ class MP3Vault:
         self.videoInfoFrame = ctk.CTkFrame(self.root, fg_color="transparent")
         self.videoInfoFrame.grid(row=1, column=0, sticky='nsew' , padx=self.padding, pady=self.padding)
         self.videoInfoFrame.columnconfigure(1, weight=1)
-        self.videoInfoFrame.rowconfigure(0, weight=1)  
+        self.videoInfoFrame.rowconfigure(0, weight=1)
         self.videoInfoFrame.rowconfigure(1, weight=1)
- 
+
+        # Row 2 sits between the video info and the download button row, created once here (unlike
+        # videoInfoFrame's contents, this never gets destroyed/rebuilt per view) — output format and
+        # quality live here rather than being crammed into videoConfigFrame, which is already close
+        # to its 750px width budget with the folder picker + Download button.
+        self.optionsRow = ctk.CTkFrame(self.root, fg_color="transparent")
+        self.optionsRow.grid(row=2, column=0, sticky='nsew', padx=self.padding, pady=(0, self.padding))
+
+        self.formatLabel = ctk.CTkLabel(self.optionsRow, text="Format:")
+        self.formatLabel.configure(text_color="#FFFFFF", font=self.regularFont)
+        self.formatLabel.grid(row=0, column=0, sticky='w', padx=(0, 10))
+
+        self.formatMenu = ctk.CTkOptionMenu(self.optionsRow, values=["mp3", "m4a", "flac", "wav"], variable=self.audioFormatVar, command=self.onFormatChange)
+        self.formatMenu.configure(font=self.regularFont, fg_color="#191818", button_color="#191818", button_hover_color="#FF4C58", width=90, height=30)
+        self.formatMenu.grid(row=0, column=1, sticky='w', padx=(0, 20))
+
+        self.qualityLabel = ctk.CTkLabel(self.optionsRow, text="Quality:")
+        self.qualityLabel.configure(text_color="#FFFFFF", font=self.regularFont)
+        self.qualityLabel.grid(row=0, column=2, sticky='w', padx=(0, 10))
+
+        self.qualityMenu = ctk.CTkOptionMenu(self.optionsRow, values=["128", "192", "320"], variable=self.audioQualityVar)
+        self.qualityMenu.configure(font=self.regularFont, fg_color="#191818", button_color="#191818", button_hover_color="#FF4C58", width=90, height=30)
+        self.qualityMenu.grid(row=0, column=3, sticky='w')
+
+        # Always present (rather than grid()/grid_remove()'d in only when relevant) so its
+        # appearance never changes this row's height or triggers a geometry recalculation — it's
+        # just blank/disabled until checkYtDlpUpdate finds a newer release.
+        self.optionsRow.columnconfigure(4, weight=1)
+        self.updateNoticeButton = ctk.CTkButton(self.optionsRow, text="", command=self.onUpdateNoticeClick, state="disabled")
+        self.updateNoticeButton.configure(fg_color="transparent", font=self.regularFont, height=30, hover_color="#FF4C58", text_color="#FFFFFF")
+        self.updateNoticeButton.grid(row=0, column=4, sticky='e')
+
         self.videoConfigFrame = ctk.CTkFrame(self.root, fg_color="transparent")
         self.videoConfigFrame.grid(row=3, sticky='nsew', padx=self.padding, pady=(0, self.padding))
         self.videoConfigFrame.rowconfigure(0, weight=1)
@@ -972,6 +1418,13 @@ class MP3Vault:
         self.deleteButton = ctk.CTkButton(self.urlFrame, text="X", command=self.cleanURL);
         self.deleteButton.grid(row=0, column=1, sticky='e')
         self.deleteButton.configure(fg_color="#191818", font=self.regularFont, height=30, width=40, hover_color="#FF4C58");
+
+        # Opens the (hidden-by-default) multi-URL queue popup — kept out of the main window
+        # entirely rather than an inline expand/collapse, since this window is a fixed 750px wide
+        # and doesn't have slack to spare.
+        self.queueButton = ctk.CTkButton(self.urlFrame, text="+ Agregar", command=self.toggleQueueWindow)
+        self.queueButton.grid(row=0, column=2, sticky='e', padx=(10, 0))
+        self.queueButton.configure(fg_color="#191818", font=self.regularFont, height=30, width=100, hover_color="#FF4C58");
 
 
         ### Label and entry for the folder destination ###

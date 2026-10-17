@@ -1,5 +1,6 @@
 import os
 import re
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import yt_dlp
 
@@ -29,6 +30,20 @@ YOUTUBE_VIDEO_URL_RE = re.compile(
 YOUTUBE_PLAYLIST_URL_RE = re.compile(
     r'^https?://(?:www\.|m\.|music\.)?youtube\.com/playlist\?list='
 )
+
+# Query parameters YouTube adds when a video is opened from a playlist/mix
+PLAYLIST_QUERY_PARAMS = {"list", "index", "start_radio"}
+
+
+""" A video URL opened from a playlist ("watch?v=X&list=Y", or the Share button's
+"youtu.be/X?list=Y") means THIS video: strips the playlist parameters, whatever their order.
+Needed because with extract_flat yt-dlp answers such a URL with a redirect to the playlist
+(_type "url", no title for youtu.be links) instead of the video (verified). """
+def video_only_url(url: str):
+    parts = urlsplit(url)
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k not in PLAYLIST_QUERY_PARAMS]
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
 
 # Common channel-name suffixes that shouldn't end up in the artist/filename
 UNWANTED_UPLOADER_SUFFIXES = [

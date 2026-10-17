@@ -255,16 +255,19 @@ class MP3Vault:
             self.resetToDefault(isEmpty=False)
 
 
-    """ Extract video information in a background thread. A watch URL that also carries a playlist
-    (watch?v=X&list=Y) needs the video itself too: both lookups happen here, never on the UI
-    thread. A pure playlist URL needs only one lookup. """
+    """ Look-up URL for what the user pasted: a playlist link as is, but a video link opened from a
+    playlist ("watch?v=X&list=Y", "youtu.be/X?list=Y") means only that video (see video_only_url) """
+    def lookupUrl(self, url: str):
+        if naming.YOUTUBE_PLAYLIST_URL_RE.match(url):
+            return url
+        return naming.video_only_url(url)
+
+
+    """ Extract video information in a background thread """
     def fetchVideoInfo(self, url: str, generation: int):
         try:
-            info_video = downloader.fetch_info(url)
-            single_video = None
-            if "list=" in url and not naming.YOUTUBE_PLAYLIST_URL_RE.match(url):
-                single_video = downloader.fetch_info(url.split("&list=")[0])
-            self.ui(self.getInfoVideo, generation, url, info_video, single_video)
+            info_video = downloader.fetch_info(self.lookupUrl(url))
+            self.ui(self.getInfoVideo, generation, url, info_video)
 
         # Handle specific download errors from yt_dlp
         except yt_dlp.utils.DownloadError as e:
@@ -351,9 +354,7 @@ class MP3Vault:
             if os.path.exists(os.path.join(os.path.normpath(opts.folder), predictedName)):
                 if not messagebox.askyesno("Already downloaded", f'"{predictedName}" already exists in that folder. Download again and overwrite it?'):
                     return
-            if "list=" in url:
-                url = self.videoInPlaylist
-            target, args = self.downloadAudio, (url, title, uploader, album, opts)
+            target, args = self.downloadAudio, (self.lookupUrl(url), title, uploader, album, opts)
 
         self.isDownloading = True
         self.cancelRequested.clear()
@@ -361,21 +362,14 @@ class MP3Vault:
 
 
     """ Handles video information retrieval and processes accordingly (main thread) """
-    def getInfoVideo(self, generation: int, url: str, info_video, single_video):
+    def getInfoVideo(self, generation: int, url: str, info_video):
         if generation != self.infoGeneration:
             log.info("Discarding stale video info for %s", url)
             return
 
         self.videoUrl = url
-        # If the URL contains 'list=', it's a playlist
-        if "list=" in url:
-            self.videoInPlaylist = url.split("&list=")[0]
-            if single_video:
-                self.handleSingleVideoInfo(single_video)
-            if "entries" in info_video:
-                self.handlePlaylistInfo(info_video)
-            elif not single_video:
-                self.handleSingleVideoInfo(info_video)
+        if "entries" in info_video:
+            self.handlePlaylistInfo(info_video)
         else:
             self.handleSingleVideoInfo(info_video)
 

@@ -93,3 +93,16 @@ def test_video_url_rejected(url):
 def test_playlist_url():
     assert naming.YOUTUBE_PLAYLIST_URL_RE.match("https://music.youtube.com/playlist?list=PL123")
     assert not naming.YOUTUBE_PLAYLIST_URL_RE.match("https://youtu.be/jNQXAC9IVRw")
+
+
+@pytest.mark.parametrize("url, expected", [
+    # Regression: the Share-button form used to keep its ?list= and download " - .mp3"
+    ("https://youtu.be/jNQXAC9IVRw?list=PL123", "https://youtu.be/jNQXAC9IVRw"),
+    ("https://youtu.be/jNQXAC9IVRw?si=abc&list=PL123", "https://youtu.be/jNQXAC9IVRw?si=abc"),
+    ("https://www.youtube.com/watch?v=jNQXAC9IVRw&list=PL123&index=3", "https://www.youtube.com/watch?v=jNQXAC9IVRw"),
+    ("https://music.youtube.com/watch?v=jNQXAC9IVRw&list=RDAMVM1&start_radio=1", "https://music.youtube.com/watch?v=jNQXAC9IVRw"),
+    ("https://www.youtube.com/watch?v=jNQXAC9IVRw&t=42", "https://www.youtube.com/watch?v=jNQXAC9IVRw&t=42"),
+    ("https://youtu.be/jNQXAC9IVRw", "https://youtu.be/jNQXAC9IVRw"),
+])
+def test_video_only_url(url, expected):
+    assert naming.video_only_url(url) == expected

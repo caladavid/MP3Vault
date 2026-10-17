@@ -236,3 +236,15 @@ def test_queue_cancel_before_start_downloads_nothing(tmp_path, write_tags):
     assert result.cancelled
     assert items == []
     assert _names(tmp_path) == []
+
+
+def test_queue_strips_playlist_from_video_links(tmp_path, write_tags):
+    seen = []
+    def fake_fetch(url):
+        seen.append(url)
+        return {'title': 'One', 'channel': 'Chan'}
+    with mock.patch.object(downloader, "fetch_info", side_effect=fake_fetch):
+        result = downloader.download_queue(["https://youtu.be/jNQXAC9IVRw?list=PL123"], DownloadOptions(str(tmp_path)),
+                                           lambda: ytdl.DownloadSession(threading.Event()))
+    assert seen == ["https://youtu.be/jNQXAC9IVRw"]
+    assert result.downloaded == 1

@@ -200,6 +200,8 @@ def download_queue(urls: list, opts: DownloadOptions, new_session, on_item=None)
     total = len(urls)
 
     for i, url in enumerate(urls, start=1):
+        # A link copied while a playlist was open still means just this video
+        url = naming.video_only_url(url)
         session = new_session()
         # Checked here too (not just inside the progress hook) in case Cancel arrives between
         # items, e.g. during the metadata lookup below, which has no progress hook.

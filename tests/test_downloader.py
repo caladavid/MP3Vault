@@ -21,6 +21,7 @@ class FakeYoutubeDL:
 
     def __init__(self, opts):
         self.opts = opts
+        FakeYoutubeDL.last_opts = opts
         self.pre_process = []
         self.folder = os.path.dirname(opts['outtmpl'])
         self.ext = opts['postprocessors'][0]['preferredcodec']
@@ -74,10 +75,15 @@ class FakeYoutubeDL:
         return os.path.join(self.folder, f"{info['title']}.{info.get('ext', 'NA')}")
 
 
+FFMPEG_FOLDER = r"C:\trusted\ffmpeg"
+
+
 @pytest.fixture
 def write_tags():
     FakeYoutubeDL.fail_after = None
+    FakeYoutubeDL.last_opts = None
     with mock.patch.object(downloader.yt_dlp, "YoutubeDL", FakeYoutubeDL), \
+         mock.patch.object(downloader.ffmpeg, "find_ffmpeg", return_value=FFMPEG_FOLDER), \
          mock.patch.object(downloader.tagging, "write_tags") as write_tags:
         yield write_tags
 
@@ -248,3 +254,21 @@ def test_queue_strips_playlist_from_video_links(tmp_path, write_tags):
                                            lambda: ytdl.DownloadSession(threading.Event()))
     assert seen == ["https://youtu.be/jNQXAC9IVRw"]
     assert result.downloaded == 1
+
+
+# --- ffmpeg
+
+def test_download_uses_trusted_ffmpeg_location(tmp_path, write_tags):
+    assert _download(tmp_path).ok
+    assert FakeYoutubeDL.last_opts['ffmpeg_location'] == FFMPEG_FOLDER
+
+
+def test_no_trusted_ffmpeg_refuses_before_yt_dlp(tmp_path, write_tags):
+    # Never fall back to yt-dlp's bare "ffmpeg" lookup (current folder first on Windows)
+    with mock.patch.object(downloader.ffmpeg, "find_ffmpeg", return_value=None):
+        single = _download(tmp_path)
+        playlist = _playlist(tmp_path, [{'title': 'Song A', 'playlistIndex': 1}])
+    assert single.status == "error" and "FFmpeg was not found" in single.error
+    assert "FFmpeg was not found" in playlist.error
+    assert FakeYoutubeDL.last_opts is None   # yt-dlp was never started
+    assert _names(tmp_path) == []

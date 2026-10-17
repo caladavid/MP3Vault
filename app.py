@@ -11,7 +11,7 @@ from PIL import Image
 
 import yt_dlp
 
-from core import downloader, errors, logs, naming, settings, updates, ytdl
+from core import downloader, errors, ffmpeg, logs, naming, settings, updates, ytdl
 from core.models import BatchResult, DownloadOptions, Progress, TrackResult
 from ui import theme
 from ui.dialogs import EditInfoDialog, QueueDialog
@@ -786,6 +786,11 @@ if __name__ == "__main__":
     logFile = logs.setup_logging()
     log.info("MP3Vault %s starting (yt-dlp %s) - https://github.com/caladavid/MP3Vault", APP_VERSION, yt_dlp.version.__version__)
     log.info("Log file: %s", logFile)
+    ffmpegFolder = ffmpeg.find_ffmpeg()
+    if ffmpegFolder:
+        log.info("Using ffmpeg from %s", ffmpegFolder)
+    else:
+        log.warning("ffmpeg not found (bundle or absolute PATH folder); downloads will be refused")
     root = ctk.CTk();
     app = MP3Vault(root);
     root.mainloop(); 

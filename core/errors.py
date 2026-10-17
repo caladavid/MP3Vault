@@ -42,7 +42,9 @@ class NetworkError(MP3VaultError):
 
 
 class FFmpegMissing(MP3VaultError):
-    user_message = "FFmpeg was not found. Install FFmpeg (or put ffmpeg.exe next to MP3Vault) and try again."
+    # Deliberately NOT "put ffmpeg.exe next to MP3Vault": that folder (often Downloads) is where a
+    # planted ffmpeg.exe would sit, so it is not trusted (see core.ffmpeg)
+    user_message = "FFmpeg was not found. Install FFmpeg and add its folder to the PATH, then try again."
 
 
 """ Anything not recognized: shows yt-dlp's own text, without its "ERROR:" prefix """

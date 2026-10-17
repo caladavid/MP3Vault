@@ -3,7 +3,7 @@ import os
 
 import yt_dlp
 
-from core import errors, naming, tagging, ytdl
+from core import errors, ffmpeg, naming, tagging, ytdl
 from core.models import BatchResult, DownloadOptions, TrackResult
 
 
@@ -19,9 +19,14 @@ def fetch_info(url: str):
         raise errors.classify(e) from e
 
 
-""" yt-dlp options shared by every real download """
+""" yt-dlp options shared by every real download. Raises errors.FFmpegMissing when no trusted
+ffmpeg exists, instead of letting yt-dlp look one up by name (see core.ffmpeg). """
 def _download_options(opts: DownloadOptions, session: ytdl.DownloadSession, **extra):
+    ffmpegFolder = ffmpeg.find_ffmpeg()
+    if not ffmpegFolder:
+        raise errors.FFmpegMissing("no ffmpeg in the bundle or in an absolute PATH folder")
     ydl_opts = {
+        'ffmpeg_location': ffmpegFolder,
         'format': 'bestaudio/best',
         'writethumbnail': opts.audio_format != 'wav',
         'postprocessors': ytdl.build_audio_postprocessors(opts.audio_format, opts.audio_quality),
@@ -66,14 +71,13 @@ URL queue. `session` is a ytdl.DownloadSession: its hook drives progress/cancel,
 up after a cancel or error. """
 def download_single(url: str, title: str, uploader: str, album: str,
                     opts: DownloadOptions, session: ytdl.DownloadSession) -> TrackResult:
-    ydl_opts = _download_options(opts, session, noplaylist=True, extract_flat='in-playlist')
-
     # Snapshot so a cancellation mid-download can clean up the .part/.webp/etc it leaves behind
     # (verified: yt_dlp doesn't clean these up itself when aborted via DownloadCancelled).
     folder = os.path.normpath(opts.folder)
     filesBefore = ytdl.list_folder(folder)
 
     try:
+        ydl_opts = _download_options(opts, session, noplaylist=True, extract_flat='in-playlist')
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             session.attach(ydl)
             info_downloaded = ydl.extract_info(url, download=True)
@@ -128,19 +132,18 @@ def download_playlist(url: str, videos: list, uploader: str, album: str,
         return result
     result.attempted = len(selectedIndices)
 
-    ydl_opts = _download_options(
-        opts, session,
-        add_metadata=True,
-        socket_timeout=60,
-        playlist_items=",".join(selectedIndices),  # Descargar solo los videos seleccionados
-    )
-
     # yt-dlp writes a thumbnail for the playlist itself (not just each video), and nothing ever
     # embeds/deletes that one — snapshot the folder now so it can be removed afterwards.
     filesBefore = ytdl.list_folder(folder)
     playlistThumbStem = None
 
     try:
+        ydl_opts = _download_options(
+            opts, session,
+            add_metadata=True,
+            socket_timeout=60,
+            playlist_items=",".join(selectedIndices),  # Descargar solo los videos seleccionados
+        )
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             session.attach(ydl)
             playlist_info = ydl.extract_info(url, download=True)

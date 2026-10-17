@@ -1,6 +1,17 @@
+import logging
 import os
 
 import yt_dlp
+
+
+# yt-dlp sends its own warnings/errors here (e.g. "HTTP Error 403") instead of only printing
+# them; its per-line progress output arrives as debug and is filtered out at INFO level.
+YTDLP_LOGGER = logging.getLogger("yt_dlp")
+
+# Plain-text output: otherwise yt-dlp wraps errors in ANSI color codes ("[0;31mERROR:"),
+# which end up both in the log and in the error text shown to the user (verified). Note the
+# old 'nocolor' key is not a yt-dlp option at all and was silently ignored.
+NO_COLOR = {'stdout': 'no_color', 'stderr': 'no_color'}
 
 
 # Player clients that still serve audio without a PO token; the default client answers
@@ -23,6 +34,8 @@ def info_options():
         'extract_flat': True,
         'socket_timeout': 10,
         'extractor_args': EXTRACTOR_ARGS,
+        'logger': YTDLP_LOGGER,
+        'color': NO_COLOR,
     }
 
 

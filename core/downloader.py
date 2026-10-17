@@ -1,8 +1,12 @@
+import logging
 import os
 
 import yt_dlp
 
 from core import naming, tagging, ytdl
+
+
+log = logging.getLogger(__name__)
 
 
 """ Downloads and tags a single video URL — the shared core reused by the single-URL button and,
@@ -20,9 +24,10 @@ def download_single(url: str, title: str, uploader: str, album: str, folder: str
         'noplaylist': True,
         'progress_hooks': [session.hook],
         'extract_flat': 'in-playlist',
-        'nocolor': True,
+        'color': ytdl.NO_COLOR,
         "outtmpl": f'{folder}/%(title)s.%(ext)s',
         'extractor_args': ytdl.EXTRACTOR_ARGS,
+        'logger': ytdl.YTDLP_LOGGER,
     }
     result = {"success": False, "filename": None, "error": None, "cancelled": False, "tagError": None}
 
@@ -50,11 +55,11 @@ def download_single(url: str, title: str, uploader: str, album: str, folder: str
             # FileExistsError if file_path already exists (e.g. re-downloading a track)
             if old_filepath != file_path:
                 os.replace(old_filepath, file_path)
-                print(f"File renamed successfully: {file_path}")
+                log.info("Renamed to %s", file_path)
             else:
-                print(f"No renaming needed, using: {file_path}")
+                log.info("No renaming needed: %s", file_path)
         else:
-            print(f"Error: Expected downloaded file not found: {old_filepath}")
+            log.error("Expected downloaded file not found: %s", old_filepath)
 
         if not os.path.exists(file_path):
             result["error"] = "Downloaded file not found."
@@ -64,17 +69,20 @@ def download_single(url: str, title: str, uploader: str, album: str, folder: str
         try:
             tagging.write_tags(file_path, cleanTitle, uploader, album)
         except Exception as e:
+            log.exception("Tagging failed for %s", file_path)
             result["tagError"] = str(e)
 
-        print(f"Downloaded: {finalFilename}")
+        log.info("Downloaded: %s", finalFilename)
         result.update(success=True, filename=finalFilename)
         return result
 
     except yt_dlp.utils.DownloadCancelled:
+        log.info("Download cancelled: %s", url)
         session.remove_cancelled_files(download_path, filesBefore)
         result["cancelled"] = True
         return result
 
     except Exception as e:
+        log.exception("Download failed for %s", url)
         result["error"] = str(e)
         return result

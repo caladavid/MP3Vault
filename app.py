@@ -1,3 +1,4 @@
+import logging
 import re
 import sys
 import os
@@ -9,18 +10,11 @@ from tkinter import messagebox
 
 import yt_dlp
 
-from core import downloader, naming, tagging, thumbnail, updates, ytdl
+from core import downloader, logs, naming, settings, tagging, thumbnail, updates, ytdl
 
-# Welcome message
-print("Welcome to MP3Vault!")
-print("Get started by entering a YouTube URL below.\n")
+log = logging.getLogger("mp3vault")
 
-# Print information about the application's creator and GitHub repository
-print("MP3Vault - Created by David Cala")
-print("Version 1.2")
-print("GitHub Repository: https://github.com/caladavid/MP3Vault\n")
-
-# Define a regular expression pattern to clean filenames
+APP_VERSION = "1.2"
 
 
 # Resolves asset paths both for normal `python app.py` runs and for a PyInstaller-frozen .exe
@@ -55,7 +49,6 @@ class MP3Vault:
         self.titleFont = ctk.CTkFont(family="Lato", size=16, weight="bold");
         self.folderImg = Image.open(resourcePath("folder.png"));
         self.editImg = Image.open(resourcePath("editar.png"));
-        self.downloadPath = "";
         self.urlValue = StringVar();
         self.editInfoWindow = None
         
@@ -63,9 +56,12 @@ class MP3Vault:
         self.artistAudioVar = ctk.StringVar()
         self.albumAudioVar = ctk.StringVar()
 
-        # Not persisted across restarts by design — resets to mp3/192kbps every launch.
-        self.audioFormatVar = ctk.StringVar(value="mp3")
-        self.audioQualityVar = ctk.StringVar(value="192")
+        # Last folder/format/quality are restored from %APPDATA%\MP3Vault\settings.json and
+        # saved again whenever the user changes one of them.
+        self.settings = settings.load_settings()
+        self.downloadPath = self.settings.last_folder
+        self.audioFormatVar = ctk.StringVar(value=self.settings.audio_format)
+        self.audioQualityVar = ctk.StringVar(value=self.settings.audio_quality)
 
         # Set right before spawning a download thread, checked inside DownloadSession.hook (which
         # runs ON that thread) to abort cleanly via yt_dlp.utils.DownloadCancelled instead of
@@ -90,27 +86,67 @@ class MP3Vault:
         self.iconPath = resourcePath('icon.ico')
         self.root.iconbitmap(self.iconPath)
 
+        # Tk swallows exceptions raised inside callbacks (button clicks, root.after) and only
+        # prints them; send them to the log file too.
+        self.root.report_callback_exception = lambda *exc: log.error("Error in UI callback", exc_info=exc)
+
         self.setupUI();
         self.noURL()
+        self.applySettingsToUI()
 
         threading.Thread(target=self.checkYtDlpUpdate, daemon=True).start()
 
 
     """ Open a folder dialog to select the download destination folder """
     def selectDownloadFolder(self):
-        self.downloadPath = filedialog.askdirectory(initialdir=os.path.expanduser("~"))
+        folder = filedialog.askdirectory(initialdir=self.downloadPath or os.path.expanduser("~"))
+        # askdirectory returns "" when the dialog is cancelled; keep the current folder then
+        # instead of clearing it (and the saved one)
+        if not folder:
+            return
+        self.downloadPath = folder
         self.folderInput.configure(text=self.downloadPath)
-        print(self.downloadPath)
+        log.info("Download folder: %s", self.downloadPath)
+        self.saveSettings()
+
+
+    """ Shows restored settings in widgets that only exist after setupUI """
+    def applySettingsToUI(self):
+        if self.downloadPath:
+            self.folderInput.configure(text=self.downloadPath)
+        self.updateQualityVisibility(self.audioFormatVar.get())
+
+
+    """ Persists the current folder/format/quality """
+    def saveSettings(self):
+        self.settings.last_folder = self.downloadPath
+        self.settings.audio_format = self.audioFormatVar.get()
+        self.settings.audio_quality = self.audioQualityVar.get()
+        settings.save_settings(self.settings)
 
 
     """ Hides the quality dropdown for lossless/uncompressed formats where bitrate is meaningless """
-    def onFormatChange(self, value):
+    def updateQualityVisibility(self, value):
         if value in ytdl.LOSSLESS_FORMATS:
             self.qualityLabel.grid_remove()
             self.qualityMenu.grid_remove()
         else:
             self.qualityLabel.grid()
             self.qualityMenu.grid()
+
+
+    def onFormatChange(self, value):
+        self.updateQualityVisibility(value)
+        self.saveSettings()
+
+
+    """ Opens the log folder in Explorer, so a user can attach mp3vault.log to a bug report """
+    def openLogFolder(self):
+        try:
+            os.makedirs(logs.log_dir(), exist_ok=True)
+            os.startfile(logs.log_dir())
+        except (OSError, AttributeError) as e:  # AttributeError: os.startfile is Windows-only
+            messagebox.showinfo("Logs", f"Log folder: {logs.log_dir()}\n\n({e})")
 
 
     """ Checks PyPI for a newer yt-dlp release — notify only, never auto-installs. Runs on a
@@ -121,8 +157,8 @@ class MP3Vault:
             latestVersion = updates.newer_ytdlp_version()
             if latestVersion:
                 self.root.after(0, self.showUpdateNotice, latestVersion)
-        except Exception:
-            pass
+        except Exception as e:
+            log.info("yt-dlp update check skipped: %s", e)
 
 
     """ Lights up the (always-present, normally blank/disabled) notice button in optionsRow """
@@ -226,6 +262,7 @@ class MP3Vault:
         # This except block runs on the worker thread, so every UI call is routed through root.after
         except yt_dlp.utils.DownloadError as e:
             errorMsg = str(e)
+            log.warning("Video info failed for %s: %s", url, errorMsg)
 
             if "HTTP Error 400" in errorMsg:
                 self.root.after(0, self.displayMessage, "Bad request (Error 400). Please check the URL.")
@@ -244,6 +281,7 @@ class MP3Vault:
 
 
         except Exception as e:
+            log.exception("Unexpected error fetching info for %s", url)
             self.root.after(0, self.displayMessage, f"Unexpected error: {str(e)}")
             
    
@@ -296,8 +334,10 @@ class MP3Vault:
         try:
             tagging.write_tags(filePath, title, artist, album, track_number=trackNumber)
         except FileNotFoundError as e:
+            log.error("Tagging skipped: %s", e)
             self.root.after(0, self.displayMessage, f"Error: {e}")
         except Exception as e:
+            log.exception("Tagging failed for %s", filePath)
             self.root.after(0, self.displayMessage, f"Error updating metadata: {e}")
 
 
@@ -592,6 +632,8 @@ class MP3Vault:
                 "outtmpl": f'{self.downloadPath}/%(title)s.%(ext)s',
                 'playlist_items': playlistItems,  # Descargar solo los videos seleccionados
                 'extractor_args': ytdl.EXTRACTOR_ARGS,
+                'logger': ytdl.YTDLP_LOGGER,
+                'color': ytdl.NO_COLOR,
             }
 
             # yt-dlp writes a thumbnail for the playlist itself (not just each video), and nothing
@@ -627,15 +669,15 @@ class MP3Vault:
                         # FileExistsError if new_filepath already exists (e.g. re-downloading a track)
                         if os.path.exists(old_filepath) and old_filepath != new_filepath:
                             os.replace(old_filepath, new_filepath)
-                            print("File renamed successfully:", new_filepath)
+                            log.info("Renamed to %s", new_filepath)
                         else:
-                            print("No renaming needed, using:", new_filepath)
+                            log.info("No renaming needed: %s", new_filepath)
 
                         if os.path.exists(new_filepath):
                             self.updateMetadata(naming.clean_filename(title), uploaderClean, album, new_filepath, trackNumber=trackNumber)
                             downloadedCount += 1
                         else:
-                            print(f"Error: File not found: {new_filepath}")
+                            log.error("Downloaded file not found: %s", new_filepath)
 
                 # Reports a count instead of a single filename — a playlist has many files, and
                 # "entries" can legitimately be empty (e.g. every selected video was deleted/private).
@@ -666,6 +708,7 @@ class MP3Vault:
             self.root.after(0, self.displayMessage, "Download cancelled.")
 
         except Exception as e:
+            log.exception("Playlist download failed for %s", self.videoUrl)
             self.root.after(0, self.displayMessage, f"An error occurred: {e}")
 
         finally:
@@ -764,7 +807,8 @@ class MP3Vault:
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
-            except Exception:
+            except Exception as e:
+                log.warning("Queue: info failed for %s: %s", url, e)
                 failCount += 1
                 continue
 
@@ -831,7 +875,7 @@ class MP3Vault:
             try:
                 image_pil = thumbnail.fetch_thumbnail(url)
             except Exception as e:
-                print(f"Error loading thumbnail: {e}")
+                log.warning("Thumbnail failed for %s: %s", url, e)
                 image_pil = None
             self.root.after(0, applyResult, image_pil)
 
@@ -1014,7 +1058,7 @@ class MP3Vault:
                 try:
                     widget.destroy()
                 except Exception as e:
-                    print(f"Error destroying widget: {e}")
+                    log.warning("Error destroying widget: %s", e)
         
         self.customText = ctk.CTkLabel(self.videoInfoFrame, text=message, text_color="#FFFFFF", font=self.titleFont, wraplength=450);
         self.customText.grid(row=0, column=1, sticky='nsew')
@@ -1124,7 +1168,7 @@ class MP3Vault:
         self.formatLabel.configure(text_color="#FFFFFF", font=self.regularFont)
         self.formatLabel.grid(row=0, column=0, sticky='w', padx=(0, 10))
 
-        self.formatMenu = ctk.CTkOptionMenu(self.optionsRow, values=["mp3", "m4a", "flac", "wav"], variable=self.audioFormatVar, command=self.onFormatChange)
+        self.formatMenu = ctk.CTkOptionMenu(self.optionsRow, values=ytdl.AUDIO_FORMATS, variable=self.audioFormatVar, command=self.onFormatChange)
         self.formatMenu.configure(font=self.regularFont, fg_color="#191818", button_color="#191818", button_hover_color="#FF4C58", width=90, height=30)
         self.formatMenu.grid(row=0, column=1, sticky='w', padx=(0, 20))
 
@@ -1132,7 +1176,7 @@ class MP3Vault:
         self.qualityLabel.configure(text_color="#FFFFFF", font=self.regularFont)
         self.qualityLabel.grid(row=0, column=2, sticky='w', padx=(0, 10))
 
-        self.qualityMenu = ctk.CTkOptionMenu(self.optionsRow, values=["128", "192", "320"], variable=self.audioQualityVar)
+        self.qualityMenu = ctk.CTkOptionMenu(self.optionsRow, values=ytdl.AUDIO_QUALITIES, variable=self.audioQualityVar, command=lambda _: self.saveSettings())
         self.qualityMenu.configure(font=self.regularFont, fg_color="#191818", button_color="#191818", button_hover_color="#FF4C58", width=90, height=30)
         self.qualityMenu.grid(row=0, column=3, sticky='w')
 
@@ -1143,6 +1187,10 @@ class MP3Vault:
         self.updateNoticeButton = ctk.CTkButton(self.optionsRow, text="", command=self.onUpdateNoticeClick, state="disabled")
         self.updateNoticeButton.configure(fg_color="transparent", font=self.regularFont, height=30, hover_color="#FF4C58", text_color="#FFFFFF")
         self.updateNoticeButton.grid(row=0, column=4, sticky='e')
+
+        self.logsButton = ctk.CTkButton(self.optionsRow, text="Logs", command=self.openLogFolder)
+        self.logsButton.configure(fg_color="#191818", font=self.regularFont, height=30, width=60, hover_color="#FF4C58")
+        self.logsButton.grid(row=0, column=5, sticky='e', padx=(10, 0))
 
         self.videoConfigFrame = ctk.CTkFrame(self.root, fg_color="transparent")
         self.videoConfigFrame.grid(row=3, sticky='nsew', padx=self.padding, pady=(0, self.padding))
@@ -1198,6 +1246,9 @@ class MP3Vault:
       
 
 if __name__ == "__main__":
+    logFile = logs.setup_logging()
+    log.info("MP3Vault %s starting (yt-dlp %s) - https://github.com/caladavid/MP3Vault", APP_VERSION, yt_dlp.version.__version__)
+    log.info("Log file: %s", logFile)
     root = ctk.CTk();
     app = MP3Vault(root);
     root.mainloop(); 

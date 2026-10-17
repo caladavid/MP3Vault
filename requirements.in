@@ -1,0 +1,12 @@
+# Direct runtime dependencies (loose ranges). The exact, hash-verified versions that
+# actually get installed live in requirements.txt, generated from this file:
+#
+#   python -m piptools compile --generate-hashes --allow-unsafe --strip-extras -o requirements.txt requirements.in
+#
+# To update one package (e.g. a new yt-dlp after YouTube breaks something):
+#   python -m piptools compile --generate-hashes --allow-unsafe --strip-extras --upgrade-package yt-dlp -o requirements.txt requirements.in
+customtkinter>=5.2.2
+pillow>=10.0.0
+mutagen>=1.46.0
+requests>=2.30.0
+yt-dlp>=2026.7.4

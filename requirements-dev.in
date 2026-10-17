@@ -1,0 +1,14 @@
+# Development + build tools on top of the runtime dependencies. Generate the lock with:
+#
+#   python -m piptools compile --generate-hashes --allow-unsafe --strip-extras -o requirements-dev.txt requirements-dev.in
+#
+# -c keeps the runtime packages at exactly the versions locked in requirements.txt, so tests and
+# the .exe build use the same versions users get.
+-r requirements.in
+-c requirements.txt
+
+pytest>=8.0
+pyflakes>=3.0
+pip-audit>=2.7
+# >=6.0: 5.x has known vulnerabilities (PYSEC-2023-292, PYSEC-2026-1813)
+pyinstaller>=6.0

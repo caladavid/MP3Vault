@@ -29,6 +29,31 @@ Get ready to enhance your music experience with **MP3Vault** – enjoy your favo
 
 This app is designed specifically for YouTube. It will not work on other websites or video platforms.
 
+## Requirements
+
+- **FFmpeg** installed with its folder on the `PATH` (e.g. `C:\ffmpeg`). For safety MP3Vault only uses an ffmpeg found in an absolute `PATH` folder (or bundled inside the .exe); it never runs an `ffmpeg.exe` from the current folder or from the folder the app sits in.
+
+## Development setup
+
+Dependencies are locked with exact versions and SHA-256 hashes (generated with [pip-tools](https://pip-tools.readthedocs.io/)):
+
+```
+python -m venv .venv
+.venv\Scripts\activate
+pip install --require-hashes -r requirements-dev.txt
+python -m pytest
+```
+
+- `requirements.in` / `requirements-dev.in`: the direct dependencies you edit.
+- `requirements.txt` / `requirements-dev.txt`: generated locks, don't edit by hand. Regenerate with the command at the top of each `.in` file, e.g. to pick up a new yt-dlp:
+  ```
+  python -m piptools compile --generate-hashes --allow-unsafe --strip-extras --upgrade-package yt-dlp -o requirements.txt requirements.in
+  python -m piptools compile --generate-hashes --allow-unsafe --strip-extras -o requirements-dev.txt requirements-dev.in
+  ```
+- Check the locks for known vulnerabilities: `pip-audit -r requirements.txt --require-hashes`
+
+The locks were generated on Windows with Python 3.11.
+
 ## Building the .exe
 
 Packaged with [auto-py-to-exe](https://github.com/brentvollebregt/auto-py-to-exe) (a GUI for PyInstaller):

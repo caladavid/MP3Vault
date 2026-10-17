@@ -10,3 +10,4 @@ dist/
 MP3Vault.txt
 TODO.md
 app - copia copy.py
+.pytest_cache/

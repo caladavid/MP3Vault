@@ -1,20 +1,15 @@
 import re
 import sys
 import os
-import subprocess
 import threading
-import time
 import customtkinter as ctk
 from customtkinter import *
-from PIL import Image, ImageOps
+from PIL import Image
 from tkinter import messagebox
-from mutagen.easyid3 import EasyID3
-from mutagen.easymp4 import EasyMP4
-from mutagen.flac import FLAC
-import requests
-from io import BytesIO
 
 import yt_dlp
+
+from core import downloader, naming, tagging, thumbnail, updates, ytdl
 
 # Welcome message
 print("Welcome to MP3Vault!")
@@ -72,11 +67,10 @@ class MP3Vault:
         self.audioFormatVar = ctk.StringVar(value="mp3")
         self.audioQualityVar = ctk.StringVar(value="192")
 
-        # Set right before spawning a download thread, checked inside _progress_hook (which runs
-        # ON that thread) to abort cleanly via yt_dlp.utils.DownloadCancelled instead of killing
-        # the thread outright.
+        # Set right before spawning a download thread, checked inside DownloadSession.hook (which
+        # runs ON that thread) to abort cleanly via yt_dlp.utils.DownloadCancelled instead of
+        # killing the thread outright.
         self.cancelRequested = threading.Event()
-        self.activeDownloadStems = set()
 
         # Inicializar variables para almacenar la información del video
         self.title_video = ""
@@ -111,7 +105,7 @@ class MP3Vault:
 
     """ Hides the quality dropdown for lossless/uncompressed formats where bitrate is meaningless """
     def onFormatChange(self, value):
-        if value in ('flac', 'wav'):
+        if value in ytdl.LOSSLESS_FORMATS:
             self.qualityLabel.grid_remove()
             self.qualityMenu.grid_remove()
         else:
@@ -119,22 +113,13 @@ class MP3Vault:
             self.qualityMenu.grid()
 
 
-    """ yt-dlp's own __version__ (e.g. "2026.07.04") and PyPI's info.version (e.g. "2026.7.4") are
-    the SAME release formatted differently — comparing them as strings says they differ forever,
-    even right after updating. Parse into an int tuple so equal versions compare equal. """
-    @staticmethod
-    def _parseVersionTuple(versionString):
-        return tuple(int(part) for part in re.split(r'\D+', versionString) if part != '')
-
-
     """ Checks PyPI for a newer yt-dlp release — notify only, never auto-installs. Runs on a
     background thread at startup; any failure (offline, PyPI down, unexpected response shape) is
     swallowed silently so a flaky network never disrupts opening the app. """
     def checkYtDlpUpdate(self):
         try:
-            response = requests.get("https://pypi.org/pypi/yt-dlp/json", timeout=5)
-            latestVersion = response.json()["info"]["version"]
-            if self._parseVersionTuple(latestVersion) > self._parseVersionTuple(yt_dlp.version.__version__):
+            latestVersion = updates.newer_ytdlp_version()
+            if latestVersion:
                 self.root.after(0, self.showUpdateNotice, latestVersion)
         except Exception:
             pass
@@ -148,7 +133,7 @@ class MP3Vault:
     """ Runs the actual update when the user clicks the notice — packaged .exe builds have no pip
     to call, so those just get an informational message instead of an update attempt. """
     def onUpdateNoticeClick(self):
-        if getattr(sys, 'frozen', False):
+        if updates.is_frozen():
             messagebox.showinfo("Update yt-dlp", "This is a packaged .exe — it can't run pip from inside itself. Rebuild the .exe with a newer yt-dlp installed, or check the yt-dlp GitHub releases page.")
             return
 
@@ -157,46 +142,10 @@ class MP3Vault:
 
 
     def _runYtDlpUpdate(self):
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-U", "yt-dlp"],
-                capture_output=True, text=True, timeout=120,
-            )
-            if result.returncode == 0:
-                message = "yt-dlp updated. Restart MP3Vault for the change to take effect."
-            else:
-                message = f"Update failed:\n{result.stderr[-500:]}"
-        except Exception as e:
-            message = f"Update failed: {e}"
-
+        message = updates.update_ytdlp()
         self.root.after(0, lambda: messagebox.showinfo("Update yt-dlp", message))
         self.root.after(0, lambda: self.updateNoticeButton.configure(state="disabled", text=""))
 
-
-
-    # NOTE: the "|" between these first two lines is required — without it Python's adjacent-string
-    # concatenation turns them into a single 2-char sequence pattern instead of an OR, and invalid
-    # filename chars like : ? " < > | stop being stripped from downloaded titles.
-    VALID_FILENAME_CHARS = re.compile(
-        r'[^\w\s\-\'.()&,]'  # Caracteres no permitidos
-        r'|[\\/:*?"<>|]' # Caracteres no válidos en nombres de archivo
-        r'|\(Official Audio\)'  # Elimina "(Official Audio)"
-        r'|\(\s-\sTopic\)'  # Elimina "( - Topic)"
-        r'|\(official\)'  # Elimina "(official)" (case-sensitive)
-        r'|\((?i:video)\)'  # Elimina "(video)" o "(Video)" (case-insensitive)
-        r'|\((?i:audio)\)'  # Elimina "(audio)" o "(Audio)" (case-insensitive)
-        r'|\((Remaster|Remastered)\)'  # Elimina "(Remaster)" o "(Remastered)"
-        r'|\(\)',  # Elimina paréntesis vacíos "()"
-    )
-
-    # Accepts youtube.com/youtu.be with or without a www./m./music. subdomain, http or https,
-    # watch/shorts links for single videos, and playlist links.
-    YOUTUBE_VIDEO_URL_RE = re.compile(
-        r'^https?://(?:www\.|m\.|music\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)(?P<id>[\w-]+)'
-    )
-    YOUTUBE_PLAYLIST_URL_RE = re.compile(
-        r'^https?://(?:www\.|m\.|music\.)?youtube\.com/playlist\?list='
-    )
 
     # Window width is fixed at 750 and never resizes (root.resizable(0, 0)), so the space actually
     # left for the title after the 200px thumbnail, fixed paddings, and the Edit button is a
@@ -206,99 +155,6 @@ class MP3Vault:
     # to fit its column — either mismatch clips the wrapped text instead of showing it in full.
     TITLE_WRAPLENGTH_SINGLE = 340   # single-video view: Edit button shares the same inner frame
     TITLE_WRAPLENGTH_PLAYLIST = 385  # playlist view: Edit button lives in a separate outer column
-
-    """ Clean a filename by removing special characters based on a regex pattern """
-    def cleanFilename(self, filename: str):
-        return re.sub(self.VALID_FILENAME_CHARS, "", filename).strip()
-    
-    def cleanUploader(self, filename: str):
-        # Lista de sufijos comunes que queremos eliminar del nombre
-        unwanted_suffixes = [
-            " - Topic",
-            " - Official",
-            " - YouTube",
-            " - VEVO",
-            " - Lyrics",
-        ]
-
-        # Elimina cada sufijo si está presente
-        for suffix in unwanted_suffixes:
-            if suffix in filename:
-                filename = filename.replace(suffix, "")
-
-        # Aplica limpieza con regex para caracteres especiales y etiquetas
-        cleaned = re.sub(self.VALID_FILENAME_CHARS, "", filename).strip()
-        return cleaned
-
-
-    """ Single source of truth for the final filename a single-video download will produce —
-    used both to predict it BEFORE downloading (duplicate-file check) and to build it after
-    (downloadAudio). Keeping this in one place means the prediction can never drift out of sync
-    with the real result, unlike the substring-search bug fixed earlier this session. """
-    def buildCleanTitleAndFilename(self, uploader: str, title: str):
-        invalidChars = r'[<>:"/\\|?*]'
-        cleanTitle = re.sub(invalidChars, '', self.cleanFilename(title))
-
-        # The uploader comes from YouTube metadata (channel/artist) or the Edit popup, so it must be
-        # cleaned too: a raw "AC/DC" creates a subfolder, "..\" escapes the download folder, and ":"
-        # on NTFS writes into an alternate data stream. Dedup against the CLEANED name so it matches
-        # the cleaned title ("AC/DC - X" -> "ACDC - X", not "AC/DC - ACDC - X").
-        cleanUploader = re.sub(invalidChars, '', self.cleanFilename(uploader))
-
-        # Use regular expressions to remove duplicate uploader names at the beginning of the filename
-        pattern = rf"^(?:{re.escape(cleanUploader)}\s*-\s*)+"
-        remainder = re.sub(pattern, "", cleanTitle)
-
-        finalFilename = f"{cleanUploader} - {remainder}.{self.audioFormatVar.get()}"
-        return cleanTitle, finalFilename
-
-
-    """ Joins a filename onto the download folder and refuses any result that lands outside it —
-    last line of defense if a future naming change ever lets a path separator through again. """
-    @staticmethod
-    def safeJoin(folder: str, filename: str):
-        base = os.path.realpath(folder)
-        fullPath = os.path.realpath(os.path.join(base, filename))
-        if os.path.dirname(fullPath) != base:
-            raise ValueError(f"Unsafe filename rejected: {filename}")
-        return fullPath
-
-
-    """ Predicts the filename a PLAYLIST-mode download will produce for one video — mirrors the
-    actual per-entry rename logic in downloadPlaylist, which (unlike downloadAudio) does NOT run
-    the title through cleanFilename/VALID_FILENAME_CHARS, only deduping a leading uploader prefix
-    on yt_dlp's own sanitized title. Predicting with buildCleanTitleAndFilename's cleaner scheme
-    here would silently miss every already-downloaded playlist track (verified: it did). """
-    def predictPlaylistFilename(self, uploaderClean: str, rawTitle: str):
-        baseFilename = yt_dlp.utils.sanitize_filename(rawTitle, restricted=False)
-        generatedFilename = f"{baseFilename}.{self.audioFormatVar.get()}"
-        pattern = rf"^(?:{re.escape(uploaderClean)}\s*-\s*)+"
-        remainder = re.sub(pattern, "", generatedFilename)
-        return f"{uploaderClean} - {remainder}"
-
-
-    """ Builds the yt_dlp postprocessors list for the currently selected format/quality """
-    def buildAudioPostprocessors(self):
-        audioFormat = self.audioFormatVar.get()
-
-        postprocessors = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': audioFormat,
-        }]
-        # Bitrate is meaningless for lossless/uncompressed formats — omitting preferredquality
-        # there lets FFmpegExtractAudio use its own lossless default instead of misapplying a kbps
-        # target to flac/wav.
-        if audioFormat not in ('flac', 'wav'):
-            postprocessors[0]['preferredquality'] = self.audioQualityVar.get()
-
-        postprocessors.append({'key': 'FFmpegMetadata'})  # Añade metadatos
-
-        # WAV has no standard place to embed cover art, so skip the thumbnail steps entirely for it
-        if audioFormat != 'wav':
-            postprocessors.append({'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg'})
-            postprocessors.append({'key': 'EmbedThumbnail'})
-
-        return postprocessors
 
 
     """ Start a new thread to fetch video information when a URL is provided """
@@ -328,7 +184,7 @@ class MP3Vault:
             self.resetToDefault(isEmpty=True) 
             return  
             
-        video_match = self.YOUTUBE_VIDEO_URL_RE.match(url)
+        video_match = naming.YOUTUBE_VIDEO_URL_RE.match(url)
         if video_match:
             self.isPlaylist = False
 
@@ -341,7 +197,7 @@ class MP3Vault:
             self.downloadBtn.configure(state="normal")
             self.threadingButton(url)
 
-        elif self.YOUTUBE_PLAYLIST_URL_RE.match(url):
+        elif naming.YOUTUBE_PLAYLIST_URL_RE.match(url):
             self.isPlaylist = True
             self.downloadBtn.configure(state="normal")
             self.threadingButton(url)
@@ -357,12 +213,7 @@ class MP3Vault:
         self.videoUrl = url
         # Local var, not self.ydl_opts: fetchVideoInfo can be re-triggered in a new thread while
         # a download thread is still running, and a shared instance attribute would race between them.
-        ydl_opts = {
-            'quiet': True,
-            'extract_flat': True,
-            'socket_timeout': 10,
-            'extractor_args': {'youtube': {'player_client': ['web_embedded', 'tv', 'android']}}
-        }
+        ydl_opts = ytdl.info_options()
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -418,7 +269,7 @@ class MP3Vault:
         # Runs on the main thread (conditionalDownload isn't a worker thread), so a blocking
         # askyesno here is safe — no root.after needed, unlike everything inside the download threads.
         if not self.isPlaylist:
-            _, predictedName = self.buildCleanTitleAndFilename(self.artistAudioVar.get(), self.titleAudioVar.get())
+            _, predictedName = naming.build_clean_title_and_filename(self.artistAudioVar.get(), self.titleAudioVar.get(), self.audioFormatVar.get())
             predictedPath = os.path.join(os.path.normpath(self.downloadPath), predictedName)
             if os.path.exists(predictedPath):
                 if not messagebox.askyesno("Already downloaded", f'"{predictedName}" already exists in that folder. Download again and overwrite it?'):
@@ -439,42 +290,13 @@ class MP3Vault:
                     
             
     """ Update metadata for an audio file using the provided information """
-    def updateMetadata(self, title: str, artist: str, album: str, audioWithNoMetadata: str, downloadPath: str, customFileName=None, trackNumber=None):
-        # Called from the download worker threads (downloadAudio/downloadPlaylist), so any
-        # displayMessage here must go through root.after rather than touching widgets directly.
-        filePath = os.path.join(downloadPath, audioWithNoMetadata)
-
-        if not os.path.exists(filePath):
-            self.root.after(0, self.displayMessage, f"Error: File not found - {filePath}")
-            return
-
-        # mutagen has no single tag class that covers every format — EasyID3 only understands
-        # ID3 (mp3), EasyMP4 only MP4 atoms (m4a), FLAC only Vorbis comments. WAV has no
-        # well-supported standard tagging scheme, so we skip tagging it rather than fail or write
-        # something most players won't read back.
-        ext = os.path.splitext(filePath)[1].lower()
-        if ext == ".wav":
-            return
-
+    def updateMetadata(self, title: str, artist: str, album: str, filePath: str, trackNumber=None):
+        # Called from the download worker threads (downloadPlaylist), so any displayMessage here
+        # must go through root.after rather than touching widgets directly.
         try:
-            if ext == ".mp3":
-                audioMetadata = EasyID3(filePath)
-            elif ext == ".m4a":
-                audioMetadata = EasyMP4(filePath)
-            elif ext == ".flac":
-                audioMetadata = FLAC(filePath)
-            else:
-                return
-
-            audioMetadata['title'] = customFileName or title
-            audioMetadata['artist'] = artist
-            audioMetadata['albumartist'] = artist
-            audioMetadata['album'] = str(album)
-            if trackNumber is not None:
-                audioMetadata['tracknumber'] = str(trackNumber)
-
-            audioMetadata.save()
-
+            tagging.write_tags(filePath, title, artist, album, track_number=trackNumber)
+        except FileNotFoundError as e:
+            self.root.after(0, self.displayMessage, f"Error: {e}")
         except Exception as e:
             self.root.after(0, self.displayMessage, f"Error updating metadata: {e}")
 
@@ -520,23 +342,10 @@ class MP3Vault:
             else None
         )
         
-        videos = info_video.get("entries", [])
-        self.playlist_videos = []
-        
-        # The position is counted over ALL entries, including the skipped ones below: yt_dlp's
-        # playlist_items refers to the real playlist position, so storing it per video keeps a
-        # checkbox pointing at the right song even when a deleted video sits before it
-        # (flat-extracted entries carry no playlist_index of their own, verified).
-        for position, video in enumerate(videos, start=1):
-            video_title = (video.get('title') or '').strip()
+        # Each video keeps its REAL playlist position (see extract_playlist_videos), so a checkbox
+        # still points at the right song when a deleted/private video sits before it.
+        self.playlist_videos = ytdl.extract_playlist_videos(info_video.get("entries", []))
 
-            # Deleted/private videos can't be downloaded, so don't offer them
-            if video_title not in ("[Deleted video]", "[Private video]", ""):
-                self.playlist_videos.append({
-                    'title': video_title,
-                    'playlistIndex': position,
-                })
-        
         self.updatePlaylistInfo(self.playlist_thumbnail)  
     
     
@@ -553,12 +362,7 @@ class MP3Vault:
     """ Extracts video information from a playlist """
     def getVideoFromPlaylist(self, videoInPlaylist: str):
         # Own local options dict, not self.ydl_opts — see the note in fetchVideoInfo about the race.
-        ydl_opts = {
-            'quiet': True,
-            'extract_flat': True,
-            'socket_timeout': 10,
-            'extractor_args': {'youtube': {'player_client': ['web_embedded', 'tv', 'android']}}
-        }
+        ydl_opts = ytdl.info_options()
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_video_in_playlist = ydl.extract_info(videoInPlaylist, download=False)
             self.title_video = info_video_in_playlist.get('title').strip()
@@ -644,37 +448,22 @@ class MP3Vault:
         self.editInfoButton.configure(fg_color="#191818", font=self.regularFont, height=35, width=80, hover_color="#FF4C58");
 
 
-    """ Handles the progress tracking of a download """
-    def _progress_hook(self, d):
-        # Runs on the download worker thread (not Tk's main thread) — raising here is yt_dlp's
-        # documented way to abort a download cleanly from inside a progress hook.
-        # Remember the base name yt-dlp is writing ("Title" for Title.webm/.part/.ytdl/.webp), so a
-        # cancel cleanup only deletes files this download produced, never unrelated files that
-        # happened to land in the same folder (e.g. a browser download into ~/Downloads).
-        # Recorded BEFORE the cancel check: a cancel raised on the very first hook call would
-        # otherwise leave its .part/.webp behind (verified).
-        if d.get('filename'):
-            self.activeDownloadStems.add(os.path.splitext(os.path.basename(d['filename']))[0])
-
-        if self.cancelRequested.is_set():
-            raise yt_dlp.utils.DownloadCancelled("Cancelled by user")
-
-        # hand off to _updateProgressUI via root.after so widget access stays on the main thread.
-        self.root.after(0, self._updateProgressUI, d)
-
-    """ Best-effort removal of the partial/temp files a cancelled download left behind: only files
-    that are new since the snapshot AND belong to a name the progress hook saw being written. """
-    def removeCancelledFiles(self, folder: str, filesBefore: set):
-        filesAfter = set(os.listdir(folder)) if os.path.isdir(folder) else set()
-        for newFile in filesAfter - filesBefore:
-            if any(newFile.startswith(stem) for stem in self.activeDownloadStems):
-                try:
-                    os.remove(os.path.join(folder, newFile))
-                except OSError:
-                    pass
+    """ New per-download session: cancel flag + list of files this run writes (see DownloadSession).
+    Its progress callback hands off to _updateProgressUI via root.after, because the hook runs on
+    the download worker thread and widget access must stay on the main thread. """
+    def newDownloadSession(self):
+        return ytdl.DownloadSession(
+            self.cancelRequested,
+            on_progress=lambda d: self.root.after(0, self._updateProgressUI, d),
+        )
 
 
     def _updateProgressUI(self, d):
+        # Updates queued via root.after can arrive after the progress frame was destroyed (e.g. a
+        # new URL loaded meanwhile); touching its widgets then raises TclError (verified).
+        if not (hasattr(self, "progressFrame") and self.progressFrame.winfo_exists()):
+            return
+
         # If downloading from a playlist, get the dynamic title
         # playlist_index lives in d['info_dict'], not at the top level of the hook dict (verified),
         # and is the REAL playlist position, so look the title up by it instead of by list offset.
@@ -705,75 +494,16 @@ class MP3Vault:
             self.progressVar.set(1)  # Set progress bar to 100%
            
    
-    """ Downloads and tags a single video URL — the shared core reused by downloadAudio (single-URL
-    button) and, per-item, by the URL queue. Returns a dict rather than showing its own success
-    popup, so a caller processing many URLs (the queue) can show ONE combined summary instead of
-    one messagebox per item. """
+    """ Downloads and tags a single video URL (see downloader.download_single), shared by the
+    single-URL button and the URL queue. A tagging failure is shown but still counts as success. """
     def _downloadSingleUrl(self, url: str, title: str, uploader: str, album: str):
-        audioFormat = self.audioFormatVar.get()
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'writethumbnail': audioFormat != 'wav',
-            'postprocessors': self.buildAudioPostprocessors(),
-            'noplaylist': True,
-            'progress_hooks': [self._progress_hook],
-            'extract_flat': 'in-playlist',
-            'nocolor': True,
-            "outtmpl": f'{self.downloadPath}/%(title)s.%(ext)s',
-            'extractor_args': {'youtube': {'player_client': ['web_embedded', 'tv', 'android']}}
-        }
-
-        # Snapshot so a cancellation mid-download can clean up the .part/.webp/etc it leaves behind
-        # (verified: yt_dlp doesn't clean these up itself when aborted via DownloadCancelled).
-        download_path_before_dl = os.path.normpath(self.downloadPath)
-        filesBeforeDl = set(os.listdir(download_path_before_dl)) if os.path.isdir(download_path_before_dl) else set()
-        self.activeDownloadStems.clear()
-
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info_downloaded = ydl.extract_info(url, download=True)
-
-                cleanTitle, finalFilename = self.buildCleanTitleAndFilename(uploader, title)
-
-                # Build file path
-                download_path = os.path.normpath(self.downloadPath)  # Ensure a valid path format
-                file_path = self.safeJoin(download_path, finalFilename)  # Complete file path
-
-                # yt-dlp names the file after the ORIGINAL video title, not our (possibly edited)
-                # title/artist — searching the folder for `cleanTitle` as a substring silently fails
-                # whenever the user edits the title in the popup, since the edited text then shares
-                # nothing with the real downloaded filename. ydl.prepare_filename() gives the exact
-                # name yt-dlp actually wrote (same approach downloadPlaylist already uses).
-                downloadedFilename = os.path.basename(ydl.prepare_filename(info_downloaded))
-                downloadedFilename = os.path.splitext(downloadedFilename)[0] + f".{audioFormat}"
-                old_filepath = self.safeJoin(download_path, downloadedFilename)
-
-                if os.path.exists(old_filepath):
-                    # os.replace (not os.rename) because on Windows os.rename raises
-                    # FileExistsError if file_path already exists (e.g. re-downloading a track)
-                    if old_filepath != file_path:
-                        os.replace(old_filepath, file_path)
-                        print(f"File renamed successfully: {file_path}")
-                    else:
-                        print(f"No renaming needed, using: {file_path}")
-                else:
-                    print(f"Error: Expected downloaded file not found: {old_filepath}")
-
-                if os.path.exists(file_path):
-                    self.updateMetadata(cleanTitle, uploader, album, finalFilename, self.downloadPath)
-                    print(f"Downloaded: {finalFilename}")
-                    return {"success": True, "filename": finalFilename, "error": None}
-                else:
-                    return {"success": False, "filename": None, "error": "Downloaded file not found."}
-
-        except yt_dlp.utils.DownloadCancelled:
-            # Best-effort cleanup of whatever partial/temp files this attempt left behind
-            # (.part, .ytdl, thumbnail, etc.) — one failed removal shouldn't stop the rest.
-            self.removeCancelledFiles(download_path_before_dl, filesBeforeDl)
-            return {"success": False, "filename": None, "error": None, "cancelled": True}
-
-        except Exception as e:
-            return {"success": False, "filename": None, "error": str(e)}
+        result = downloader.download_single(
+            url, title, uploader, album, self.downloadPath,
+            self.audioFormatVar.get(), self.audioQualityVar.get(), self.newDownloadSession(),
+        )
+        if result["tagError"]:
+            self.root.after(0, self.displayMessage, f"Error updating metadata: {result['tagError']}")
+        return result
 
 
     """ Initiates audio download from a given URL """
@@ -826,14 +556,14 @@ class MP3Vault:
             # Predicts each selected video's final filename (same helper as the single-video check)
             # and skips any that already exist — asking per-song would be impractical for a
             # multi-track playlist, so this auto-skips instead of prompting.
-            uploaderClean = self.cleanUploader(uploader)
+            uploaderClean = naming.clean_uploader(uploader)
             download_path_check = os.path.normpath(self.downloadPath)
             selected_indices = []
             skippedExisting = 0
             for i, state in enumerate(self.checkboxStates):
                 if not state.get():
                     continue
-                predictedName = self.predictPlaylistFilename(uploaderClean, self.playlist_videos[i]['title'])
+                predictedName = naming.predict_playlist_filename(uploaderClean, self.playlist_videos[i]['title'], self.audioFormatVar.get())
                 if os.path.exists(os.path.join(download_path_check, predictedName)):
                     skippedExisting += 1
                 else:
@@ -851,24 +581,24 @@ class MP3Vault:
             playlistItems = ",".join(selected_indices)
 
             audioFormat = self.audioFormatVar.get()
+            session = self.newDownloadSession()
             ydl_opts = {
                 'format': 'bestaudio/best',
                 'writethumbnail': audioFormat != 'wav',
-                'postprocessors': self.buildAudioPostprocessors(),
+                'postprocessors': ytdl.build_audio_postprocessors(audioFormat, self.audioQualityVar.get()),
                 'add_metadata': True,
                 'socket_timeout': 60,
-                'progress_hooks': [self._progress_hook],
+                'progress_hooks': [session.hook],
                 "outtmpl": f'{self.downloadPath}/%(title)s.%(ext)s',
                 'playlist_items': playlistItems,  # Descargar solo los videos seleccionados
-                'extractor_args': {'youtube': {'player_client': ['web_embedded', 'tv', 'android']}}
+                'extractor_args': ytdl.EXTRACTOR_ARGS,
             }
 
             # yt-dlp writes a thumbnail for the playlist itself (not just each video), and nothing
             # ever embeds/deletes that one — snapshot the folder now so we can remove it afterwards
             # without having to guess yt-dlp's own filename-sanitizing rules for the playlist title.
             download_path_before = os.path.normpath(self.downloadPath)
-            filesBeforeDownload = set(os.listdir(download_path_before)) if os.path.isdir(download_path_before) else set()
-            self.activeDownloadStems.clear()
+            filesBeforeDownload = ytdl.list_folder(download_path_before)
 
             downloadedCount = 0
             playlistThumbStem = None
@@ -880,54 +610,32 @@ class MP3Vault:
                 if "entries" in playlist_info:
                     # If the URL is a playlist, we loop through each video in the playlist
                     for fallbackIndex, video in enumerate(playlist_info["entries"], start=1):
-                        title = video.get('title', 'Desconocido').strip()
+                        title = (video.get('title') or 'Desconocido').strip()
                         # playlist_index reflects the video's real position in the playlist (yt_dlp
                         # sets it during playlist processing); fall back to loop position only if
                         # yt_dlp didn't provide one.
                         trackNumber = video.get('playlist_index') or fallbackIndex
 
-                        uploader = self.cleanUploader(uploader)
-                        # Extracts the base name of the file, removing path info
-                        generatedFilename = os.path.basename(ydl.prepare_filename(video)).strip()
-                        # Change the file extension to match the selected output format
-                        baseFilename = os.path.splitext(generatedFilename)[0]
-                        generatedFilename = baseFilename + f".{audioFormat}"
-
-                        # Use regular expressions to remove duplicate uploader names at the beginning of the filename
-                        pattern = rf"^(?:{re.escape(uploader)}\s*-\s*)+"
-                        remainder = re.sub(pattern, "", generatedFilename)
-                        # Finalizes the file name by including only one uploader and the remainder of the original filename
-                        newFilename = f"{uploader} - {remainder}" # Sets the final filename format
-                        newFilename = os.path.basename(newFilename)  # Ensures there is no path info in the filename
-                        # Build the full path for the old and new file names
-                        download_path = os.path.normpath(self.downloadPath) # Normalizes the download path
-                        old_filepath = os.path.join(download_path, generatedFilename) # Old file path before renaming
-                        new_filepath = self.safeJoin(download_path, newFilename) # New file path after renaming
+                        # yt-dlp wrote "<its sanitized title>.<ext>"; after conversion the extension
+                        # is the selected format. Renamed through the SAME helper the
+                        # already-downloaded prediction uses, so the two can't drift apart.
+                        baseFilename = os.path.splitext(os.path.basename(ydl.prepare_filename(video)).strip())[0]
+                        old_filepath = naming.safe_join(download_path_before, f"{baseFilename}.{audioFormat}")
+                        new_filepath = naming.safe_join(download_path_before, naming.playlist_filename(uploaderClean, baseFilename, audioFormat))
 
                         # os.replace (not os.rename) because on Windows os.rename raises
                         # FileExistsError if new_filepath already exists (e.g. re-downloading a track)
                         if os.path.exists(old_filepath) and old_filepath != new_filepath:
-                            os.replace(old_filepath, new_filepath) # Renames the file if a conflict exists
+                            os.replace(old_filepath, new_filepath)
                             print("File renamed successfully:", new_filepath)
                         else:
                             print("No renaming needed, using:", new_filepath)
 
-                        # Use the final filename to update the video metadata
-                        filename = new_filepath
-
-                        if os.path.exists(filename):
-                             # If the file exists, proceed to update its metadata
-                            self.updateMetadata(
-                                self.cleanFilename(title),
-                                uploader,
-                                album,
-                                filename,
-                                self.downloadPath,
-                                trackNumber=trackNumber,
-                            )
+                        if os.path.exists(new_filepath):
+                            self.updateMetadata(naming.clean_filename(title), uploaderClean, album, new_filepath, trackNumber=trackNumber)
                             downloadedCount += 1
                         else:
-                            print(f"Error: File not found: {filename}")
+                            print(f"Error: File not found: {new_filepath}")
 
                 # Reports a count instead of a single filename — a playlist has many files, and
                 # "entries" can legitimately be empty (e.g. every selected video was deleted/private).
@@ -940,8 +648,7 @@ class MP3Vault:
             # Clean up the orphaned playlist-level thumbnail (see snapshot comment above) — only the
             # new image named exactly after the playlist, never any other image that showed up in
             # the folder meanwhile (per-video thumbnails are already consumed by EmbedThumbnail).
-            filesAfterDownload = set(os.listdir(download_path_before)) if os.path.isdir(download_path_before) else set()
-            for newFile in filesAfterDownload - filesBeforeDownload:
+            for newFile in ytdl.list_folder(download_path_before) - filesBeforeDownload:
                 stem, ext = os.path.splitext(newFile)
                 if stem == playlistThumbStem and ext.lower() in ('.jpg', '.jpeg', '.webp', '.png'):
                     try:
@@ -955,7 +662,7 @@ class MP3Vault:
             # Cancellation jumps straight here from inside the `with` block, skipping the
             # thumbnail cleanup above entirely — so it needs to run again here, and also cover
             # partial audio downloads (.part/.ytdl), not just leftover thumbnail images.
-            self.removeCancelledFiles(download_path_before, filesBeforeDownload)
+            session.remove_cancelled_files(download_path_before, filesBeforeDownload)
             self.root.after(0, self.displayMessage, "Download cancelled.")
 
         except Exception as e:
@@ -1006,9 +713,9 @@ class MP3Vault:
             line = line.strip()
             if not line:
                 continue
-            elif self.YOUTUBE_VIDEO_URL_RE.match(line):
+            elif naming.YOUTUBE_VIDEO_URL_RE.match(line):
                 urls.append(line)
-            elif self.YOUTUBE_PLAYLIST_URL_RE.match(line):
+            elif naming.YOUTUBE_PLAYLIST_URL_RE.match(line):
                 playlistCount += 1
             else:
                 invalidCount += 1
@@ -1053,12 +760,7 @@ class MP3Vault:
             # The queue never touches urlInput/titleAudioVar (those belong to the single-URL flow),
             # so each item needs its own lightweight metadata fetch — same options as fetchVideoInfo,
             # but run synchronously here since we're already on a background thread.
-            ydl_opts = {
-                'quiet': True,
-                'extract_flat': True,
-                'socket_timeout': 10,
-                'extractor_args': {'youtube': {'player_client': ['web_embedded', 'tv', 'android']}}
-            }
+            ydl_opts = ytdl.info_options()
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
@@ -1073,7 +775,7 @@ class MP3Vault:
 
             # Same already-downloaded check as the single-URL/playlist flows, auto-skipping rather
             # than prompting — a queue can have many items, asking per-song isn't practical here either.
-            _, predictedName = self.buildCleanTitleAndFilename(artist, title)
+            _, predictedName = naming.build_clean_title_and_filename(artist, title, self.audioFormatVar.get())
             if os.path.exists(os.path.join(os.path.normpath(self.downloadPath), predictedName)):
                 skippedExisting += 1
                 continue
@@ -1107,50 +809,18 @@ class MP3Vault:
         self.albumAudioVar.set(album_video)
     
          
-    THUMBNAIL_SIZE = (200, 113)
-    THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024   # real YouTube thumbnails are well under 1MB
-    THUMBNAIL_MAX_SECONDS = 10              # total budget; requests' timeout= is per-read only
-    THUMBNAIL_MAX_PIXELS = 4096 * 4096      # checked from the header, before decoding anything
-
     """ Gray box shown until the thumbnail arrives (or permanently, if there is none) """
     def createThumbnailPlaceholder(self, parent, thumbnailUrl):
         return ctk.CTkLabel(
             parent,
             text="Loading image..." if thumbnailUrl else "No image available",
-            width=self.THUMBNAIL_SIZE[0],
-            height=self.THUMBNAIL_SIZE[1],
+            width=thumbnail.THUMBNAIL_SIZE[0],
+            height=thumbnail.THUMBNAIL_SIZE[1],
             fg_color="gray",
             text_color="white",
             corner_radius=8,
             font=("Arial", 12)
         )
-
-
-    """ Downloads and decodes a thumbnail with hard limits, since the URL and the bytes both come
-    from remote metadata: caps size and total time, requires an image Content-Type, and rejects
-    huge dimensions before decoding (decompression bombs). Runs on a worker thread only. """
-    def fetchThumbnail(self, url: str):
-        deadline = time.monotonic() + self.THUMBNAIL_MAX_SECONDS
-        with requests.get(url, timeout=5, stream=True) as response:
-            response.raise_for_status()
-            if not response.headers.get("Content-Type", "").startswith("image/"):
-                raise ValueError("Thumbnail is not an image")
-
-            data = BytesIO()
-            for chunk in response.iter_content(chunk_size=64 * 1024):
-                data.write(chunk)
-                if data.tell() > self.THUMBNAIL_MAX_BYTES:
-                    raise ValueError("Thumbnail too large")
-                if time.monotonic() > deadline:
-                    raise TimeoutError("Thumbnail download too slow")
-
-        data.seek(0)
-        image_pil = Image.open(data)  # lazy: only the header is parsed here
-        if image_pil.width * image_pil.height > self.THUMBNAIL_MAX_PIXELS:
-            raise ValueError("Thumbnail dimensions too large")
-
-        # Uses ImageOps.fit to crop and resize the image without distortion
-        return ImageOps.fit(image_pil, self.THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
 
 
     """ Fetches the thumbnail off the Tk main thread so a slow host can't freeze the window, then
@@ -1159,7 +829,7 @@ class MP3Vault:
     def loadThumbnailAsync(self, url: str, label):
         def worker():
             try:
-                image_pil = self.fetchThumbnail(url)
+                image_pil = thumbnail.fetch_thumbnail(url)
             except Exception as e:
                 print(f"Error loading thumbnail: {e}")
                 image_pil = None
@@ -1172,7 +842,7 @@ class MP3Vault:
                 label.configure(text="No image available")
                 return
             # Kept on self so Tk doesn't garbage-collect the image while it's displayed
-            self.imageInsideVideoInfoFrame = ctk.CTkImage(light_image=image_pil, size=self.THUMBNAIL_SIZE)
+            self.imageInsideVideoInfoFrame = ctk.CTkImage(light_image=image_pil, size=thumbnail.THUMBNAIL_SIZE)
             label.configure(image=self.imageInsideVideoInfoFrame, text="", fg_color="transparent")
 
         threading.Thread(target=worker, daemon=True).start()

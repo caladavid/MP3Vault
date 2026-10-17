@@ -17,7 +17,7 @@ class DownloadOptions:
 class TrackResult:
     status: str                         # "ok" | "cancelled" | "error"
     filename: Optional[str] = None
-    error: Optional[str] = None
+    error: Optional[str] = None         # user-facing text (errors.MP3VaultError.user_message)
     tag_error: Optional[str] = None     # set when the file downloaded fine but tagging failed
 
     @property
@@ -37,7 +37,7 @@ class BatchResult:
     skipped_existing: int = 0           # already in the folder, not downloaded again
     failed: int = 0
     cancelled: bool = False
-    error: Optional[str] = None         # a failure that stopped the whole batch
+    error: Optional[str] = None         # user-facing text of a failure that stopped the whole batch
     tag_errors: list = field(default_factory=list)
 
 

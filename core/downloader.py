@@ -3,17 +3,20 @@ import os
 
 import yt_dlp
 
-from core import naming, tagging, ytdl
+from core import errors, naming, tagging, ytdl
 from core.models import BatchResult, DownloadOptions, TrackResult
 
 
 log = logging.getLogger(__name__)
 
 
-""" Metadata-only lookup (no download). Errors propagate to the caller. """
+""" Metadata-only lookup (no download). Raises an errors.MP3VaultError subclass. """
 def fetch_info(url: str):
-    with yt_dlp.YoutubeDL(ytdl.info_options()) as ydl:
-        return ydl.extract_info(url, download=False)
+    try:
+        with yt_dlp.YoutubeDL(ytdl.info_options()) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception as e:
+        raise errors.classify(e) from e
 
 
 """ yt-dlp options shared by every real download """
@@ -99,7 +102,7 @@ def download_single(url: str, title: str, uploader: str, album: str,
     except Exception as e:
         log.exception("Download failed for %s", url)
         session.remove_leftovers(folder, filesBefore, partial_only=True)
-        return TrackResult("error", error=str(e))
+        return TrackResult("error", error=errors.classify(e).user_message)
 
 
 """ Downloads the given playlist videos (dicts from ytdl.extract_playlist_videos, already
@@ -175,7 +178,7 @@ def download_playlist(url: str, videos: list, uploader: str, album: str,
     except Exception as e:
         log.exception("Playlist download failed for %s", url)
         session.remove_leftovers(folder, filesBefore, partial_only=True)
-        result.error = str(e)
+        result.error = errors.classify(e).user_message
         return result
 
     # Remove the orphaned playlist-level thumbnail — only the new image named exactly after the

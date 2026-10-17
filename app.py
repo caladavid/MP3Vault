@@ -3,15 +3,20 @@ import queue
 import sys
 import os
 import threading
+import types
+from tkinter import filedialog, messagebox
+
 import customtkinter as ctk
-from customtkinter import *
 from PIL import Image
-from tkinter import messagebox
 
 import yt_dlp
 
-from core import downloader, logs, naming, settings, thumbnail, updates, ytdl
+from core import downloader, errors, logs, naming, settings, updates, ytdl
 from core.models import BatchResult, DownloadOptions, Progress, TrackResult
+from ui import theme
+from ui.dialogs import EditInfoDialog, QueueDialog
+from ui.progress_view import ProgressView
+from ui.video_views import PlaylistView, SingleVideoView
 
 log = logging.getLogger("mp3vault")
 
@@ -44,15 +49,21 @@ class MP3Vault:
         # exactly their natural height instead of competing with videoInfoFrame for leftover space —
         # giving row 2 weight=1 here once squeezed optionsRow down to ~1px in the taller (350/700) views.
         
-        self.padding = 20
-        
+        self.padding = theme.PADDING
+
         self.regularFont = ctk.CTkFont(family="Lato", size=14);
         self.titleFont = ctk.CTkFont(family="Lato", size=16, weight="bold");
+        self.fonts = types.SimpleNamespace(regular=self.regularFont, title=self.titleFont)
         self.folderImg = Image.open(resourcePath("folder.png"));
         self.editImg = Image.open(resourcePath("editar.png"));
-        self.urlValue = StringVar();
-        self.editInfoWindow = None
-        
+        self.urlValue = ctk.StringVar();
+
+        # Views currently on screen (None when not shown); see the ui package
+        self.videoView = None       # SingleVideoView or PlaylistView
+        self.progressView = None
+        self.editDialog = None
+        self.queueDialog = None
+
         self.titleAudioVar = ctk.StringVar()
         self.artistAudioVar = ctk.StringVar()
         self.albumAudioVar = ctk.StringVar()
@@ -82,10 +93,6 @@ class MP3Vault:
         self.albumArtistVideo = ""
         self.album_thumbnail = ""
         
-        # Inicializar la Progress Bar (No se muestra hasta que se usa)
-        self.progressBar = None
-        self.loadingText = None
-
         #self.root.set_appearance_mode("dark") ARREGLAR
 
         # Set the application icon
@@ -190,16 +197,6 @@ class MP3Vault:
         self.ui(lambda: self.updateNoticeButton.configure(state="disabled", text=""))
 
 
-    # Window width is fixed at 750 and never resizes (root.resizable(0, 0)), so the space actually
-    # left for the title after the 200px thumbnail, fixed paddings, and the Edit button is a
-    # constant too — measured directly from the real widget tree (see conversation/commit notes).
-    # CTkLabel needs wraplength AND width set to the same value: wraplength alone still leaves the
-    # widget's own canvas at its small default size, and grid can silently shrink a too-large width
-    # to fit its column — either mismatch clips the wrapped text instead of showing it in full.
-    TITLE_WRAPLENGTH_SINGLE = 340   # single-video view: Edit button shares the same inner frame
-    TITLE_WRAPLENGTH_PLAYLIST = 385  # playlist view: Edit button lives in a separate outer column
-
-
     """ Start a new thread to fetch video information when a URL is provided. Each lookup gets a
     generation number: if the user pastes another URL before this one answers, the late (stale)
     answer is discarded instead of overwriting the newer one. """
@@ -269,33 +266,13 @@ class MP3Vault:
             info_video = downloader.fetch_info(self.lookupUrl(url))
             self.ui(self.getInfoVideo, generation, url, info_video)
 
-        # Handle specific download errors from yt_dlp
-        except yt_dlp.utils.DownloadError as e:
-            errorMsg = str(e)
-            log.warning("Video info failed for %s: %s", url, errorMsg)
-            self.ui(self.showInfoError, generation, self.infoErrorMessage(errorMsg))
+        except errors.MP3VaultError as e:
+            log.warning("Video info failed for %s: %s", url, e.detail)
+            self.ui(self.showInfoError, generation, e.user_message)
 
         except Exception as e:
             log.exception("Unexpected error fetching info for %s", url)
             self.ui(self.showInfoError, generation, f"Unexpected error: {str(e)}")
-
-
-    """ User-facing text for a yt-dlp lookup error """
-    @staticmethod
-    def infoErrorMessage(errorMsg: str):
-        if "HTTP Error 400" in errorMsg:
-            return "Bad request (Error 400). Please check the URL."
-        elif "HTTP Error 404" in errorMsg:
-            return "Video not found (Error 404)."
-        elif "HTTP Error 403" in errorMsg:
-            return "Access denied (Error 403)."
-        elif "HTTP Error 500" in errorMsg:
-            return "Internal server error (Error 500)."
-        elif "youtube:truncated_id" in errorMsg:
-            return "The YouTube video ID is incomplete or truncated."
-        elif "Video unavailable" in errorMsg:
-            return "The YouTube video ID is unavailable."
-        return f"Error retrieving video information: {errorMsg}"
 
 
     def showInfoError(self, generation: int, message: str):
@@ -341,10 +318,7 @@ class MP3Vault:
         album = self.albumAudioVar.get()
 
         if self.isPlaylist:
-            selected = [
-                video for video, state in zip(getattr(self, "playlist_videos", []), getattr(self, "checkboxStates", []))
-                if state.get()
-            ]
+            selected = self.videoView.selected_videos() if isinstance(self.videoView, PlaylistView) else []
             if not selected:
                 messagebox.showwarning("Warning", "Please select at least one video to download.")
                 return
@@ -409,79 +383,16 @@ class MP3Vault:
         self.updateVideoInfo(self.album_thumbnail)
         
     
-    """ Closes the pop-up window for editing playlist information """
-    def closeEditInfoPopUp(self):
-        # Write the popup's own vars back into the real ones, then let them (and their entries'
-        # variable traces) get garbage-collected with the window instead of leaking into it.
-        self.titleAudioVar.set(self.titleEditUrlEntry.get())
-        self.artistAudioVar.set(self.artistEditUrlEntry.get())
-        self.albumAudioVar.set(self.albumEditUrlEntry.get())
-        self.editInfoWindow.destroy()
-
-
-    """ Opens a pop-up window to edit the playlist information """
+    """ Opens the popup to edit title/artist/album (one at a time) """
     def editInfoPopUp(self):
-        if self.editInfoWindow and self.editInfoWindow.winfo_exists():
-            self.editInfoWindow.lift()
+        if self.editDialog and self.editDialog.exists():
+            self.editDialog.lift()
             return
-
-        self.editInfoWindow = ctk.CTkToplevel(self.root)
-        self.editInfoWindow.geometry("410x250")
-        self.editInfoWindow.title("Edit audio details")
-
-        # Separate StringVars scoped to this popup, seeded from the current values — NOT the same
-        # titleAudioVar/artistAudioVar/albumAudioVar the main window's labels use. CTkEntry never
-        # removes its internal trace on its textvariable when destroyed, so binding these entries
-        # directly to the long-lived vars left a dangling trace on every popup open/close that later
-        # crashed with `_tkinter.TclError: invalid command name` the next time a new video loaded
-        # and the shared var's .set() fired the stale callback.
-        self.titleEditUrlEntry = ctk.StringVar(value=self.titleAudioVar.get())
-        self.artistEditUrlEntry = ctk.StringVar(value=self.artistAudioVar.get())
-        self.albumEditUrlEntry = ctk.StringVar(value=self.albumAudioVar.get())
-
-        self.editInfoUrlFrame = ctk.CTkFrame(self.editInfoWindow, fg_color="transparent")
-        self.editInfoUrlFrame.grid(row=0, column=0, sticky='nsew', padx=self.padding, pady=self.padding)
-        self.editInfoUrlFrame.columnconfigure((0, 3), weight=1) 
-        self.videoInfoFrame.rowconfigure((0, 3), weight=1) 
-        
-        ### Label and entry for the video URL ###
-        self.headLabel = ctk.CTkLabel(self.editInfoUrlFrame, text="Edit details");
-        self.headLabel.grid(row=0, column=1)
-        self.headLabel.configure(text_color="#FFFFFF", font=self.regularFont, padx=1, pady=1); 
-        
-        ### Label and entry for the folder destination ###
-        self.titleEditLabel = ctk.CTkLabel(self.editInfoUrlFrame, text="Title");
-        self.titleEditLabel.configure(text_color="#FFFFFF", font=self.regularFont, pady=1);
-        self.titleEditLabel.grid(row=1, column=0, sticky='nsew', padx=(0, 10))
-
-        self.titleEditUrlInput = ctk.CTkEntry(self.editInfoUrlFrame, textvariable=self.titleEditUrlEntry)
-        self.titleEditUrlInput.grid(row=1, column=1, pady=10, sticky='nsew')
-        self.titleEditUrlInput.configure(font=self.regularFont, text_color="#000000", fg_color="#FFFFFF", width=300, height=30)
-        
-        
-        ### Label and entry for the folder destination ###
-        self.artistEditLabel = ctk.CTkLabel(self.editInfoUrlFrame, text="Artist");
-        self.artistEditLabel.configure(text_color="#FFFFFF", font=self.regularFont, pady=1);
-        self.artistEditLabel.grid(row=2, column=0, sticky='nsew', padx=(0, 10))
-
-        self.artistEditUrlInput = ctk.CTkEntry(self.editInfoUrlFrame, textvariable=self.artistEditUrlEntry)
-        self.artistEditUrlInput.grid(row=2, column=1, pady=10, sticky='nsew')
-        self.artistEditUrlInput.configure(font=self.regularFont, text_color="#000000", fg_color="#FFFFFF", width=300, height=30)
-        
-        
-        ### Label and entry for the folder destination ###
-        self.albumEditLabel = ctk.CTkLabel(self.editInfoUrlFrame, text="Album");
-        self.albumEditLabel.configure(text_color="#FFFFFF", font=self.regularFont, pady=1);
-        self.albumEditLabel.grid(row=3, column=0, sticky='nsew', padx=(0, 10))
-
-        self.albumEditUrlInput = ctk.CTkEntry(self.editInfoUrlFrame, textvariable=self.albumEditUrlEntry)
-        self.albumEditUrlInput.grid(row=3, column=1, pady=10, sticky='nsew')
-        self.albumEditUrlInput.configure(font=self.regularFont, text_color="#000000", fg_color="#FFFFFF", width=300, height=30)
-        
-        # Button to select the download destination folder
-        self.editInfoButton = ctk.CTkButton(self.editInfoUrlFrame, text="Confirm", command=self.closeEditInfoPopUp);
-        self.editInfoButton.grid(row=4, column=1, pady=2)
-        self.editInfoButton.configure(fg_color="#191818", font=self.regularFont, height=35, width=80, hover_color="#FF4C58");
+        self.editDialog = EditInfoDialog(
+            self.root, self.regularFont,
+            self.titleAudioVar.get(), self.artistAudioVar.get(), self.albumAudioVar.get(),
+            on_confirm=self.updateEditInfoAudio,
+        )
 
 
     """ Runs fn(*args) on the Tk main thread. Worker threads must never touch widgets directly;
@@ -518,34 +429,14 @@ class MP3Vault:
         )
 
 
-    """ Progress updates can arrive after the progress frame was destroyed (e.g. a new URL loaded
-    meanwhile); touching its widgets then raises TclError (verified). """
-    def progressFrameAlive(self):
-        return hasattr(self, "progressFrame") and self.progressFrame.winfo_exists()
-
-
     def _updateProgressUI(self, progress: Progress):
-        if not self.progressFrameAlive():
-            return
-
-        title = progress.title
-        if progress.playlist_index is not None:
-            title = f"{title} ({progress.playlist_index}/{progress.playlist_count or '?'})"
-
-        if progress.status == 'downloading':
-            self.progressVar.set(progress.fraction)
-            self.progressLabel.configure(text=f"Descargando: {title}")
-            self.speedLabel.configure(text=f"Velocidad: {progress.speed} - ETA: {progress.eta}")
-
-        elif progress.status == 'finished':
-            self.progressVar.set(1)  # Set progress bar to 100%
-            self.progressLabel.configure(text=f"Descarga completada: {title}")
-            self.speedLabel.configure(text="¡Completado!")
+        if self.progressView:
+            self.progressView.update(progress)
 
 
     def setProgressText(self, text: str):
-        if self.progressFrameAlive():
-            self.progressLabel.configure(text=text)
+        if self.progressView:
+            self.progressView.set_text(text)
 
 
     """ Worker: downloads one video (see downloader.download_single) """
@@ -570,7 +461,7 @@ class MP3Vault:
         elif result.cancelled:
             self.displayMessage("Download cancelled.")
         else:
-            self.displayMessage(f"An error occurred: {result.error}")
+            self.displayMessage(result.error)
 
 
     """ Worker: downloads the selected playlist videos (see downloader.download_playlist) """
@@ -590,7 +481,7 @@ class MP3Vault:
             self.displayMessage("Download cancelled.")
             return
         if result.error:
-            self.displayMessage(f"An error occurred: {result.error}")
+            self.displayMessage(result.error)
             return
 
         if not result.attempted:
@@ -609,28 +500,14 @@ class MP3Vault:
 
     """ Opens the popup for pasting multiple video URLs (kept hidden until "+ Agregar" is clicked) """
     def toggleQueueWindow(self):
-        if getattr(self, "queueWindow", None) and self.queueWindow.winfo_exists():
-            self.queueWindow.lift()
+        if self.queueDialog and self.queueDialog.exists():
+            self.queueDialog.lift()
             return
-
-        self.queueWindow = ctk.CTkToplevel(self.root)
-        self.queueWindow.title("Add multiple URLs")
-        self.queueWindow.geometry("420x300")
-
-        self.queueLabel = ctk.CTkLabel(self.queueWindow, text="Paste one YouTube video URL per line:")
-        self.queueLabel.configure(text_color="#FFFFFF", font=self.regularFont)
-        self.queueLabel.grid(row=0, column=0, padx=20, pady=(20, 5), sticky='w')
-
-        self.queueTextbox = ctk.CTkTextbox(self.queueWindow, width=380, height=180)
-        self.queueTextbox.grid(row=1, column=0, padx=20, pady=5)
-
-        self.queueDownloadButton = ctk.CTkButton(self.queueWindow, text="Download All", command=self.startQueueDownload)
-        self.queueDownloadButton.configure(fg_color="#191818", font=self.regularFont, height=35, hover_color="#FF4C58")
-        self.queueDownloadButton.grid(row=2, column=0, pady=(10, 20))
+        self.queueDialog = QueueDialog(self.root, self.regularFont, on_submit=self.startQueueDownload)
 
 
     """ Validates the pasted URLs and kicks off the sequential background download """
-    def startQueueDownload(self):
+    def startQueueDownload(self, text: str):
         if not self.downloadPath:
             messagebox.showwarning("Warning", "Please select a download folder first.")
             return
@@ -644,7 +521,7 @@ class MP3Vault:
         urls = []
         invalidCount = 0
         playlistCount = 0
-        for line in self.queueTextbox.get("1.0", "end").splitlines():
+        for line in text.splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -667,7 +544,7 @@ class MP3Vault:
         if notes:
             messagebox.showinfo("Queue", f"Queuing {len(urls)} video(s). " + "; ".join(notes) + ".")
 
-        self.queueWindow.destroy()
+        self.queueDialog.close()
         self.isDownloading = True
         self.cancelRequested.clear()
         threading.Thread(target=self._runQueueWorker, args=(urls, self.currentOptions()), daemon=True).start()
@@ -706,202 +583,35 @@ class MP3Vault:
         self.albumAudioVar.set(album_video)
     
          
-    """ Gray box shown until the thumbnail arrives (or permanently, if there is none) """
-    def createThumbnailPlaceholder(self, parent, thumbnailUrl):
-        return ctk.CTkLabel(
-            parent,
-            text="Loading image..." if thumbnailUrl else "No image available",
-            width=thumbnail.THUMBNAIL_SIZE[0],
-            height=thumbnail.THUMBNAIL_SIZE[1],
-            fg_color="gray",
-            text_color="white",
-            corner_radius=8,
-            font=("Arial", 12)
-        )
-
-
-    """ Fetches the thumbnail off the Tk main thread so a slow host can't freeze the window, then
-    hands the result back via root.after. The label may already be gone by then (user pasted a new
-    URL meanwhile), so it is checked before being touched. """
-    def loadThumbnailAsync(self, url: str, label):
-        def worker():
-            try:
-                image_pil = thumbnail.fetch_thumbnail(url)
-            except Exception as e:
-                log.warning("Thumbnail failed for %s: %s", url, e)
-                image_pil = None
-            self.ui(applyResult, image_pil)
-
-        def applyResult(image_pil):
-            if not label.winfo_exists():
-                return
-            if image_pil is None:
-                label.configure(text="No image available")
-                return
-            # Kept on self so Tk doesn't garbage-collect the image while it's displayed
-            self.imageInsideVideoInfoFrame = ctk.CTkImage(light_image=image_pil, size=thumbnail.THUMBNAIL_SIZE)
-            label.configure(image=self.imageInsideVideoInfoFrame, text="", fg_color="transparent")
-
-        threading.Thread(target=worker, daemon=True).start()
-
-
-    """ Updates the video information display, including thumbnail and text fields """
+    """ Shows the single-video view (thumbnail, title/artist/album, Edit) """
     def updateVideoInfo(self, album_thumbnail):
         self.clearVideoInfo()
         self.updateEditInfoAudio(self.title_video, self.artist_video, self.album_video)
-        
-        self.singleVideosFrame = ctk.CTkFrame(self.videoInfoFrame, fg_color="transparent")
-        self.singleVideosFrame.grid(row=0, column=0, columnspan=2, rowspan=3, sticky='nsew', padx=self.padding, pady=self.padding)
-        self.singleVideosFrame.grid_rowconfigure((0,3), weight=1)
-        self.singleVideosFrame.grid_columnconfigure((1,3), weight=1)
-
-        # Placeholder now, real thumbnail filled in by a background thread (see loadThumbnailAsync)
-        self.imageLabelInsideVideoInfoFrame = self.createThumbnailPlaceholder(self.singleVideosFrame, album_thumbnail)
-        if album_thumbnail:
-            self.loadThumbnailAsync(album_thumbnail, self.imageLabelInsideVideoInfoFrame)
-
         self.root.geometry("750x350")
-        self.imageLabelInsideVideoInfoFrame.grid(row=0, column=0, sticky='w', padx=(self.padding, 0), pady=self.padding)
-        
-        self.textInsideVideoInfoFrame = ctk.CTkFrame(self.singleVideosFrame, fg_color="transparent")
-        self.textInsideVideoInfoFrame.grid(row=0, column=1, columnspan=3, padx=self.padding, pady=self.padding, sticky='ew')
-        self.textInsideVideoInfoFrame.grid_columnconfigure(0, weight=1)  # Asegura que la última columna tenga espacio
-        self.textInsideVideoInfoFrame.grid_columnconfigure(1, weight=1)  # Asegura que la última columna tenga espacio
-        self.textInsideVideoInfoFrame.grid_rowconfigure((0, 2), weight=1)
-        
-        # Button to select the download destination folder
-        self.editInfoButton = ctk.CTkButton(self.textInsideVideoInfoFrame, text="Edit", command=self.editInfoPopUp, image=CTkImage(dark_image=self.editImg, light_image=self.editImg));
-        self.editInfoButton.configure(fg_color="#191818", font=self.regularFont, height=33, width=40, hover_color="#FF4C58");
-        self.editInfoButton.grid(row=2, column=3, sticky='se')
+        self.videoView = SingleVideoView(
+            self.videoInfoFrame, (self.titleAudioVar, self.artistAudioVar, self.albumAudioVar), self.fonts,
+            self.editImg, self.editInfoPopUp, album_thumbnail, self.ui,
+        )
 
-        self.titleVideoInfo = ctk.CTkLabel(self.textInsideVideoInfoFrame, width=self.TITLE_WRAPLENGTH_SINGLE, wraplength=self.TITLE_WRAPLENGTH_SINGLE, anchor='w', justify='left', textvariable=self.titleAudioVar, font=self.titleFont )
-        self.titleVideoInfo.grid(row=0, column=0, sticky='w')
-        self.titleVideoInfo.columnconfigure(0, weight=1)
 
-        self.artistVideoInfo = ctk.CTkLabel(self.textInsideVideoInfoFrame, textvariable=self.artistAudioVar, font=self.regularFont)
-        self.artistVideoInfo.grid(row=1, column=0, sticky='w')
-        
-        self.albumVideoInfo = ctk.CTkLabel(self.textInsideVideoInfoFrame, textvariable=self.albumAudioVar, font=self.regularFont)
-        self.albumVideoInfo.grid(row=2, column=0, sticky='w')
-
-        
+    """ Shows the playlist view (header + one checkbox per video) """
     def updatePlaylistInfo(self, album_thumbnail: str):
         self.clearVideoInfo()
         self.updateEditInfoAudio(self.playlistTitle, self.playlistArtist, self.playlistAlbum)
-
-        self.videosFromPlaylistFrame = ctk.CTkFrame(self.videoInfoFrame, fg_color="transparent")
-        self.videosFromPlaylistFrame.grid(row=0, column=0, columnspan=2, rowspan=3, sticky='nsew', padx=self.padding, pady=self.padding)
-        self.videosFromPlaylistFrame.grid_rowconfigure((0,3), weight=1)
-        self.videosFromPlaylistFrame.grid_columnconfigure((1,3), weight=1)
-        
-        # Placeholder now, real thumbnail filled in by a background thread (see loadThumbnailAsync)
-        self.imageLabelInsideVideoInfoFrame = self.createThumbnailPlaceholder(self.videosFromPlaylistFrame, album_thumbnail)
-        if album_thumbnail:
-            self.loadThumbnailAsync(album_thumbnail, self.imageLabelInsideVideoInfoFrame)
-        else:
-            self.videosFromPlaylistFrame.grid_rowconfigure(0, weight=0)
-            self.videosFromPlaylistFrame.grid_columnconfigure(0, weight=0) 
-           
-               
         self.root.geometry("750x700")
-        self.imageLabelInsideVideoInfoFrame.grid(row=0, column=0, sticky='ew', padx=self.padding, pady=self.padding)
+        self.videoView = PlaylistView(
+            self.videoInfoFrame, (self.titleAudioVar, self.artistAudioVar, self.albumAudioVar), self.fonts,
+            self.editImg, self.editInfoPopUp, album_thumbnail, self.ui, self.playlist_videos,
+        )
 
-        self.textInsideVideoInfoFrame = ctk.CTkFrame(self.videosFromPlaylistFrame, fg_color="transparent")
-        self.textInsideVideoInfoFrame.grid(row=0, column=1, columnspan=3, sticky='w', padx=self.padding, pady=self.padding)
-        self.textInsideVideoInfoFrame.grid_columnconfigure(0, weight=1)
-        self.textInsideVideoInfoFrame.grid_columnconfigure(1, weight=1)
-        
-        # Button to select the download destination folder
-        self.editInfoButton = ctk.CTkButton(self.videosFromPlaylistFrame, text="Edit", command=self.editInfoPopUp, image=CTkImage(dark_image=self.editImg, light_image=self.editImg));
-        self.editInfoButton.configure(fg_color="#191818", font=self.regularFont, height=33, width=40, hover_color="#FF4C58");
-        self.editInfoButton.grid(row=0, column=3, sticky='ne')
-        
-        
-        self.titleVideoInfo = ctk.CTkLabel(self.textInsideVideoInfoFrame, width=self.TITLE_WRAPLENGTH_PLAYLIST, wraplength=self.TITLE_WRAPLENGTH_PLAYLIST, anchor='w', justify='left', textvariable=self.titleAudioVar, font=self.titleFont)
-        self.titleVideoInfo.grid(row=0, column=0, sticky='w')
-        self.titleVideoInfo.columnconfigure(0, weight=1)
 
-        self.artistVideoInfo = ctk.CTkLabel(self.textInsideVideoInfoFrame, textvariable=self.artistAudioVar, font=self.regularFont)
-        self.artistVideoInfo.grid(row=1, column=0, sticky='w')
-        
-        
-        self.albumVideoInfo = ctk.CTkLabel(self.textInsideVideoInfoFrame, textvariable=self.albumAudioVar, font=self.regularFont)
-        self.albumVideoInfo.grid(row=2, column=0, sticky='w')
-        
-        self.videosListScrollable = ctk.CTkScrollableFrame(self.videosFromPlaylistFrame)
-        self.videosListScrollable.grid(row=4, column=0, rowspan=2, columnspan=4, sticky='nsew', padx=self.padding, pady=self.padding)
-        self.videosListScrollable.columnconfigure(1, weight=1)
-        self.videosListScrollable.columnconfigure(2, weight=1)
-        self.videosListScrollable.columnconfigure(3, weight=1)
-        self.videosListScrollable.rowconfigure(0, weight=1)
-        
-        maxTextLength = 80
-        
-        separator = ctk.CTkFrame(self.videosFromPlaylistFrame, height=2, fg_color="gray")
-        separator.grid(row=3, column=0, columnspan=4, sticky="new", pady=5)
-        
-        self.loadingLabel = ctk.CTkLabel(self.videosListScrollable, text="Loading...", font=self.regularFont)
-        self.loadingLabel.grid(row=0, column=0, sticky="w", padx=self.padding, pady=self.padding)
-        
-        
-        def loadPlaylistVideos():
-            if self.playlist_videos:
-                self.loadingLabel.destroy()  # Eliminar el mensaje "Cargando..."
-                
-                # Lista para almacenar los estados de los CheckBoxes
-                self.checkboxStates = []
-                
-                for i, video in enumerate(self.playlist_videos, start=1):
-                    video_title = video['title']
-                    
-                    if len(video_title) > maxTextLength:
-                        video_title = video_title[:maxTextLength] + "..."
-                    
-                    checkboxVar = ctk.BooleanVar(value=True)
-                    self.checkboxStates.append(checkboxVar)
-
-                    indexVideo = ctk.CTkLabel(self.videosListScrollable, text=f"{i}.", font=self.regularFont)
-                    indexVideo.grid(row=i, column=0, sticky="w", padx=10, pady=5)
-                    
-                    checkboxVideo = ctk.CTkCheckBox(self.videosListScrollable, text=video_title, variable=checkboxVar)
-                    checkboxVideo.grid(row=i, column=1, sticky="w")
-                    
-                
-                # Asegurar que el masterCheckbox coincida con el estado inicial
-                self.masterCheckboxVar.set(True)
-            else:
-                self.loadingLabel.configure(text="No se encontraron videos")  # Mantener
-         
-         
-        self.masterCheckboxVar = ctk.BooleanVar(value=True) 
-        
-        self.masterCheckbox = ctk.CTkCheckBox(self.videosFromPlaylistFrame, text="Deselect all", command=self.toggleAllCheckboxes, variable=self.masterCheckboxVar  )
-        self.masterCheckbox.grid(row=3, column=0, sticky="s")  
-            
-        # Ejecutar `loadPlaylistVideos` después de 500ms (medio segundo) sin congelar la UI
-        self.videosListScrollable.after(500, loadPlaylistVideos)
-    
-    
     """ Clears all video information by removing existing widgets from the frame """
     def clearVideoInfo(self):
+        self.videoView = None
         for widget in self.videoInfoFrame.winfo_children():
             widget.destroy()
             
     
-    """ Toggles all checkboxes based on the state of the master checkbox """    
-    def toggleAllCheckboxes(self):
-        newState = self.masterCheckboxVar.get()
-        
-        # Updates the state of each individual checkbox
-        for checkbox in self.checkboxStates:
-            checkbox.set(newState)
-            
-        # Forces an update of the global selection variable    
-        self.masterCheckboxVar.set(newState)
-        self.masterCheckbox.configure(text="Deselect All" if newState else "Select All")
-        
-
-            
     """ Displays a message inside the video info frame """        
     def displayMessage(self, message: str):
         
@@ -941,57 +651,32 @@ class MP3Vault:
         self.noUrlSubText.configure(text_color="#FFFFFF", font=self.regularFont)
 
         
-    """ Shows the progress frame when the download starts """
+    """ Shows the progress view when the download starts """
     def show_progress_frame(self):
-        for widget in self.videoInfoFrame.winfo_children():
-            widget.destroy() # Removes any existing widgets
-
+        self.clearVideoInfo()
         # Taller than the other 280px views — videoInfoFrame splits its height 50/50 between two
         # weighted rows (this one and the empty-queue row), and the extra Cancel button row no
         # longer fits in a plain 280px window without overlapping optionsRow/videoConfigFrame below
         # (measured: 350 is the bare minimum, 380 leaves comfortable margin).
         self.root.geometry("750x380")
-        self.progressVar = ctk.DoubleVar() # Initializes the progress bar variable
-        
-        self.progressFrame = ctk.CTkFrame(self.videoInfoFrame, fg_color="transparent")
-        self.progressFrame.grid(row=0, column=1, columnspan=4, sticky="nsew", padx=10, pady=10)  # Ajusta según el layout
-        self.progressFrame.grid_columnconfigure(1, weight=1)
-        self.progressFrame.grid_columnconfigure(2, weight=1)
-        self.progressFrame.grid_columnconfigure(3, weight=1)
-        self.progressFrame.grid_columnconfigure(4, weight=1)
-        
-        self.progressLabel = ctk.CTkLabel(self.progressFrame, text="Downloading...")
-        self.progressLabel.grid(row=0, column=0, pady=5, columnspan=5)
-
-        
-        self.progressBar = ctk.CTkProgressBar(self.progressFrame, variable=self.progressVar)
-        self.progressBar.grid(row=1, column=0, sticky="ew", padx=10, pady=10, columnspan=5)
-        self.progressBar.set(0)  # Iniciar en 0%
-
-        self.speedLabel = ctk.CTkLabel(self.progressFrame, text="Speed: - ETA: -")
-        self.speedLabel.grid(row=2, column=0, pady=5, columnspan=5)
-
-        # Lives only inside this frame, which is created fresh per download and destroyed by
-        # hide_progress_frame — so "visible only during an active download" comes for free.
-        self.cancelDownloadButton = ctk.CTkButton(self.progressFrame, text="Cancel", command=self.requestCancel)
-        self.cancelDownloadButton.configure(fg_color="#191818", font=self.regularFont, height=30, width=100, hover_color="#FF4C58")
-        self.cancelDownloadButton.grid(row=3, column=0, pady=(5, 0), columnspan=5)
+        self.progressView = ProgressView(self.videoInfoFrame, self.regularFont, on_cancel=self.requestCancel)
 
 
-    """ Signals the active download thread to stop via _progress_hook, and disables the button
-    immediately so a second click can't fire while the worker thread unwinds. """
+    """ Signals the active download thread to stop (checked in DownloadSession.hook) """
     def requestCancel(self):
         self.cancelRequested.set()
-        self.cancelDownloadButton.configure(state="disabled", text="Cancelling...")
+        if self.progressView:
+            self.progressView.set_cancelling()
 
 
-    """ Hides the progress frame after the download is completed """
+    """ Hides the progress view after the download is completed """
     def hide_progress_frame(self):
-        if hasattr(self, "progressFrame"):
-            self.progressFrame.destroy()
+        if self.progressView:
+            self.progressView.destroy()
+            self.progressView = None
             self.cleanURL()
-    
-    
+
+
     """ Resets the UI to default view after the download or when there's no URL """        
     def resetToDefault(self, isEmpty=False):
         self.noURL(isEmpty=isEmpty)
@@ -1086,10 +771,9 @@ class MP3Vault:
         self.folderInput = ctk.CTkLabel(self.selectFolderFrame, text="Select Download Folder")
         self.folderInput.configure(font=self.regularFont, text_color="#000000", fg_color="#FFFFFF", width=260, height=30, corner_radius=5, justify="left")
         self.folderInput.grid(row=0, column=1, sticky='n')
-        self.urlInput.bind("<KeyRelease>", lambda _: self.validateURL())
 
         # Button to select the download destination folder
-        self.folderButton = ctk.CTkButton(self.selectFolderFrame, text="", command=self.selectDownloadFolder, image=CTkImage(dark_image=self.folderImg, light_image=self.folderImg));
+        self.folderButton = ctk.CTkButton(self.selectFolderFrame, text="", command=self.selectDownloadFolder, image=ctk.CTkImage(dark_image=self.folderImg, light_image=self.folderImg));
         self.folderButton.configure(fg_color="#191818", font=self.regularFont, height=33, width=80, hover_color="#FF4C58");
         self.folderButton.grid(row=0, column=2, sticky='n')
       
